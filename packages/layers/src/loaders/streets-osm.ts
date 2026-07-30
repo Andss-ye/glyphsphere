@@ -48,17 +48,36 @@ export const WATER_CLASS = ROAD_CLASSES.length;
 export const STREAM_CLASS = ROAD_CLASSES.length + 1;
 export const CLASS_NAMES = [...ROAD_CLASSES, 'water', 'stream'] as const;
 
-/** Un `way` de Overpass con geometría, que es lo único que este módulo consume. */
+/**
+ * Un `way` de Overpass con geometría.
+ *
+ * Se aceptan **las dos formas** que puede devolver, y no por gusto: `out geom;` sobre vías
+ * normales da `geometry: [{lon, lat}, ...]`, mientras que la consulta ligera de abajo pasa por
+ * `convert` y da una geometría GeoJSON. La caché en disco del horneado tiene años de respuestas
+ * con la primera forma, así que dejar de entenderla obligaría a volver a descargarlo todo.
+ */
 export interface OverpassWay {
   type: string;
   id: number;
   tags?: Record<string, string>;
-  geometry?: { lon: number; lat: number }[];
+  geometry?: { lon: number; lat: number }[] | { type: string; coordinates: [number, number][] };
 }
 
 /**
- * La consulta. Solo lo que se puede dibujar y significa algo a esta escala: la red transitable y
- * el agua. Veredas, accesos de servicio y senderos triplican el peso y a 4 m por celda son ruido.
+ * La consulta.
+ *
+ * Pide **solo lo que se puede dibujar**: la red transitable y el agua. Veredas, accesos de
+ * servicio y senderos triplican el peso y a 4 m por celda son ruido.
+ *
+ * Y pide **solo la etiqueta que se usa**. `out geom;` devuelve cada vía con todas sus etiquetas —
+ * nombre, superficie, carriles, velocidad máxima, iluminación — y las coordenadas como objetos
+ * `{lat, lon}`. Medido sobre Madrid, un cuadro de 0.14° eran **19 MB descargados para producir un
+ * tile de 160 KB**. Pasando por `convert` para quedarse con la clase y con geometría GeoJSON, el
+ * mismo cuadro baja un 59 %.
+ *
+ * No es solo ancho de banda: Overpass reparte turnos por IP cobrando el trabajo que le pedís, así
+ * que una consulta obesa se paga en 504 en la siguiente. Pedir de menos es lo que hace que la
+ * segunda ciudad también cargue.
  */
 export function overpassQuery(
   bbox: readonly [number, number, number, number],
@@ -66,23 +85,43 @@ export function overpassQuery(
 ): string {
   const [minLon, minLat, maxLon, maxLat] = bbox;
   const box = `${minLat},${minLon},${maxLat},${maxLon}`;
-  return `[out:json][timeout:${timeoutS}];(
-    way["highway"~"^(${ROAD_CLASSES.join('|')})$"](${box});
-    way["waterway"~"^(river|canal|stream)$"](${box});
-    way["natural"="water"](${box});
-  );out geom;`;
+  return (
+    `[out:json][timeout:${timeoutS}];(` +
+    `way["highway"~"^(${ROAD_CLASSES.join('|')})$"](${box});` +
+    `way["waterway"~"^(river|canal|stream)$"](${box});` +
+    `way["natural"="water"](${box});` +
+    `)->.w;` +
+    // Una sola etiqueta, `cls`, con el valor que decide la clase. Las tres son excluyentes en la
+    // práctica, así que concatenarlas deja exactamente el valor presente.
+    `.w convert way ::id=id(),::geom=geom(),` +
+    `cls=t["highway"]+t["waterway"]+t["natural"];` +
+    `out geom;`
+  );
+}
+
+/** Las coordenadas de un way, venga en la forma que venga. */
+export function geometryOf(way: OverpassWay): [number, number][] {
+  const geometry = way.geometry;
+  if (!geometry) return [];
+  if (Array.isArray(geometry)) return geometry.map((p) => [p.lon, p.lat]);
+  return geometry.coordinates ?? [];
 }
 
 /** Índice de clase de un way, o -1 si no se dibuja. */
 export function classOf(way: OverpassWay): number {
-  const highway = way.tags?.['highway'];
-  if (highway !== undefined) {
-    const index = (ROAD_CLASSES as readonly string[]).indexOf(highway);
+  const tags = way.tags;
+  // `cls` es lo que produce la consulta ligera; el resto es la forma clásica, que sigue viva en
+  // la caché en disco del horneado.
+  const value = tags?.['cls'] ?? tags?.['highway'];
+  if (value !== undefined) {
+    const index = (ROAD_CLASSES as readonly string[]).indexOf(value);
     if (index >= 0) return index;
+    if (value === 'stream') return STREAM_CLASS;
+    if (value === 'river' || value === 'canal' || value === 'water') return WATER_CLASS;
   }
-  const waterway = way.tags?.['waterway'];
+  const waterway = tags?.['waterway'];
   if (waterway === 'stream') return STREAM_CLASS;
-  if (waterway !== undefined || way.tags?.['natural'] === 'water') return WATER_CLASS;
+  if (waterway !== undefined || tags?.['natural'] === 'water') return WATER_CLASS;
   return -1;
 }
 
@@ -99,14 +138,19 @@ export function classOf(way: OverpassWay): number {
  * inventa geometría: los puntos que salen son exactamente los que entraron.
  */
 export function chainWays(ways: readonly OverpassWay[]): EncodableWay[] {
-  const byClass = new Map<number, OverpassWay[]>();
+  // Las coordenadas se normalizan una vez, acá, para que el resto del encadenado no sepa de qué
+  // forma vinieron.
+  const byClass = new Map<number, { lon: number; lat: number }[][]>();
   for (const way of ways) {
-    if (way.type !== 'way' || !way.geometry || way.geometry.length < 2) continue;
+    if (way.type !== 'way') continue;
+    const points = geometryOf(way);
+    if (points.length < 2) continue;
     const classIndex = classOf(way);
     if (classIndex < 0) continue;
+    const geometry = points.map(([lon, lat]) => ({ lon, lat }));
     const list = byClass.get(classIndex);
-    if (list) list.push(way);
-    else byClass.set(classIndex, [way]);
+    if (list) list.push(geometry);
+    else byClass.set(classIndex, [geometry]);
   }
 
   const out: EncodableWay[] = [];
@@ -121,8 +165,7 @@ export function chainWays(ways: readonly OverpassWay[]): EncodableWay[] {
       if (list) list.push(index);
       else ends.set(key, [index]);
     };
-    group.forEach((way, index) => {
-      const points = way.geometry!;
+    group.forEach((points, index) => {
       push(keyOf(points[0]!), index);
       push(keyOf(points[points.length - 1]!), index);
     });
@@ -137,7 +180,7 @@ export function chainWays(ways: readonly OverpassWay[]): EncodableWay[] {
         if (next === undefined) return;
 
         used[next] = true;
-        const candidate = group[next]!.geometry!;
+        const candidate = group[next]!;
         const forward = keyOf(candidate[0]!) === tail;
         const rest = forward ? candidate.slice(1) : candidate.slice(0, -1).reverse();
         for (const point of rest) points.push(point);
@@ -147,7 +190,7 @@ export function chainWays(ways: readonly OverpassWay[]): EncodableWay[] {
     for (let i = 0; i < group.length; i++) {
       if (used[i]) continue;
       used[i] = true;
-      const points = [...group[i]!.geometry!];
+      const points = [...group[i]!];
       extend(points);
       points.reverse();
       extend(points);
@@ -261,12 +304,14 @@ const DEFAULT_MIRRORS = [
  * lo que pasó durante esta sesión: `overpass-api.de` empezó a rechazar la conexión al instante
  * mientras otro espejo seguía respondiendo 200.
  *
- * 60 s porque una consulta real llega a tardar 15 s solo en ejecutarse, más la cola.
+ * 25 s porque la consulta ligera se sirve en unos pocos: medido, París entero en 3.7 s. Un
+ * espejo que no ha contestado una consulta así en veinticinco segundos no está trabajando, está
+ * encolando.
+ *
+ * Es el presupuesto de **toda** la búsqueda, no de cada espejo: ver `deadline` más abajo. Cuando
+ * era por espejo, una zona que ninguno podía servir tardaba entre 60 y 187 segundos en admitirlo.
  */
-const DEFAULT_TIMEOUT_MS = 60_000;
-
-/** Por qué espejo se empieza. Rota para no concentrar los reintentos en uno solo. */
-let mirrorCursor = 0;
+const DEFAULT_TIMEOUT_MS = 25_000;
 
 /**
  * Cuánto se aparta un espejo que acaba de fallar.
@@ -279,37 +324,145 @@ let mirrorCursor = 0;
  */
 const MIRROR_COOLDOWN_MS = 300_000;
 
+/**
+ * Lo que se aparta un espejo que dijo "ahora no puedo".
+ *
+ * Un 504 o un 429 no es un espejo roto: es uno ocupado, y son servidores públicos que están
+ * ocupados a menudo. Apartarlo cinco minutos por eso deja al usuario sin el mejor espejo por un
+ * pico de treinta segundos. El apartado largo se reserva para lo que sí es duradero — que la
+ * conexión sea rechazada, que es como se manifiesta el límite por IP.
+ */
+const BUSY_COOLDOWN_MS = 45_000;
+
 /** Cuándo se puede volver a probar cada espejo. */
 const mirrorBenchedUntil = new Map<string, number>();
 
-/** Los espejos utilizables ahora, los apartados al final por si no queda ninguno. */
+/**
+ * Los espejos por orden de preferencia: primero los utilizables, después los apartados.
+ *
+ * Los apartados van **por cuánto les queda de castigo, del menor al mayor**, y eso importa más de
+ * lo que parece. Cuando todos están apartados hay que intentarlo igual — rendirse garantiza no
+ * dibujar nada — y sin ordenarlos se prueba primero el que agotó su plazo de veinticinco segundos
+ * sin contestar en vez del que solo devolvió un 504 al instante. Medido, eso convertía una
+ * consulta de tres segundos en una espera de un minuto.
+ *
+ * Los sanos conservan el orden de la lista. Hubo una versión que rotaba entre ellos para repartir
+ * la carga, y **hacía daño**: dos de los tres espejos aceptan la conexión y no contestan, así que
+ * rotar a ciegas repartía peticiones a servidores que cuestan veinticinco segundos cada uno. El
+ * apartado por salud ya reparte la carga, pero según cómo se están portando de verdad en vez de
+ * por turno.
+ */
 function mirrorsByHealth(mirrors: readonly string[]): string[] {
   const now = Date.now();
   const healthy: string[] = [];
   const benched: string[] = [];
-  for (let i = 0; i < mirrors.length; i++) {
-    const mirror = mirrors[(mirrorCursor + i) % mirrors.length]!;
+  for (const mirror of mirrors) {
     ((mirrorBenchedUntil.get(mirror) ?? 0) > now ? benched : healthy).push(mirror);
   }
-  // Los apartados siguen al final: si todos lo están, más vale intentarlo que no dibujar nada.
+  benched.sort((a, b) => (mirrorBenchedUntil.get(a) ?? 0) - (mirrorBenchedUntil.get(b) ?? 0));
   return [...healthy, ...benched];
 }
 
 /** Olvida el estado de los espejos. Para los tests, que no comparten reloj. */
 export function resetMirrorHealth(): void {
   mirrorBenchedUntil.clear();
-  mirrorCursor = 0;
+  lastProbeMs = 0;
 }
 
 /**
- * Medio lado del cuadro que se pide en vivo: 0.07°, unos 15 km de lado.
+ * Cada cuánto se vuelve a preguntar por el estado de los espejos.
  *
- * Es el mismo tamaño que usa el horneado para cada sub-cuadro, y no por casualidad — el cuadro
- * metropolitano entero devuelve 504, que es lo que obligó a partirlo. Acá además conviene que sea
- * chico por otra razón: una consulta que tarda menos llega antes de que el usuario se haya ido.
- * Al desplazarse se piden cuadros vecinos y la cobertura se acumula.
+ * El sondeo es barato pero no gratis, y la salud de un servidor público no cambia cada segundo.
  */
-const DEFAULT_HALF_SPAN_DEG = 0.07;
+const PROBE_INTERVAL_MS = 300_000;
+
+/** Un espejo que no contesta su estado en esto es que no está. */
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Margen para no rendirse por un turno que está a punto de liberarse.
+ *
+ * Un espejo con el turno a tres segundos vista lo va a tener antes de que llegue la petición.
+ */
+const GRACE_MS = 3_000;
+
+let lastProbeMs = 0;
+
+/** `.../api/interpreter` -> `.../api/status`. */
+function statusUrlFor(mirror: string): string {
+  return mirror.replace(/\/interpreter\/?$/, '/status');
+}
+
+/**
+ * Segundos hasta que el espejo tenga turno, según lo que él mismo dice.
+ *
+ * Overpass publica su cola: `2 slots available now.` o `Slot available after: <fecha>, in 42
+ * seconds.` — una línea por turno. Se toma el más próximo.
+ */
+export function slotWaitSeconds(status: string): number {
+  if (/slots? available now/i.test(status)) return 0;
+  const waits = [...status.matchAll(/in (-?\d+) seconds/gi)].map((m) => Number(m[1]));
+  if (waits.length === 0) return 0;
+  return Math.max(0, Math.min(...waits));
+}
+
+/**
+ * Pregunta a cada espejo cómo está, en paralelo, y apunta el resultado.
+ *
+ * **Es lo que evita pagar el plazo completo por un servidor que no existe.** Dos de los tres
+ * espejos públicos aceptan la conexión y no contestan nunca: descubrirlo con la consulta real
+ * cuesta veinticinco segundos cada uno, y como se prueban en cadena, una ciudad que se resolvía
+ * en cuatro segundos tardaba más de un minuto en fallar. Su endpoint de estado, en cambio, los
+ * separa en menos de uno: medido, 0.65 s el que funciona contra el plazo agotado en los otros dos.
+ *
+ * De paso resuelve lo otro: si el espejo dice que no tiene turno libre hasta dentro de N segundos,
+ * se le cree y se le espera, en vez de insistir y llevarse un 429.
+ */
+async function probeMirrors(mirrors: readonly string[]): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastProbeMs < PROBE_INTERVAL_MS) return false;
+  lastProbeMs = now;
+
+  const usable = await Promise.all(
+    mirrors.map(async (mirror) => {
+      try {
+        const response = await fetch(statusUrlFor(mirror), {
+          // El mismo User-Agent que la consulta, y por el mismo motivo: sin él Overpass responde
+          // 406. Sin esto el sondeo se envenenaba solo — daba por muertos a los tres espejos y la
+          // búsqueda se rendía en medio segundo con todos disponibles.
+          headers: { 'User-Agent': USER_AGENT },
+          signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+          mirrorBenchedUntil.set(mirror, Date.now() + BUSY_COOLDOWN_MS);
+          return false;
+        }
+        const waitMs = slotWaitSeconds(await response.text()) * 1000;
+        if (waitMs > 0) mirrorBenchedUntil.set(mirror, Date.now() + waitMs);
+        else mirrorBenchedUntil.delete(mirror);
+        return waitMs <= GRACE_MS;
+      } catch {
+        mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
+        return false;
+      }
+    }),
+  );
+
+  return !usable.some(Boolean);
+}
+
+/**
+ * Medio lado del cuadro que se pide en vivo: 0.035°, o sea 0.07° de lado, unos 8 km.
+ *
+ * Es **exactamente el sub-cuadro que usa el horneado**, y no por casualidad: es el tamaño que
+ * Overpass sirve sin ahogarse, descubierto cuando el cuadro metropolitano entero devolvía 504 y
+ * hubo que partirlo en 4x4. Pedir en vivo el cuadro completo era pedir cuatro veces esa área.
+ *
+ * Chico tiene además una segunda ventaja acá: una consulta que tarda menos llega antes de que el
+ * usuario se haya ido a otro lado. Al desplazarse se piden cuadros vecinos y la cobertura se
+ * acumula.
+ */
+const DEFAULT_HALF_SPAN_DEG = 0.035;
 
 /**
  * Overpass responde 406 a un User-Agent anónimo, y el de Node lo es.
@@ -377,17 +530,49 @@ export async function fetchOnlineStreets(
     data: overpassQuery(bbox, Math.floor(timeoutMs / 1000)),
   });
 
-  // Rotado para no concentrar la carga, y con los que acaban de fallar al final de la cola.
+  /**
+   * Un sondeo barato antes de gastar el plazo largo contra un servidor que no está — y si el
+   * sondeo dice que **ninguno** tiene turno ahora, se admite al momento.
+   *
+   * Consultar igual no acelera nada: el servidor va a rechazar o encolar, y el usuario se queda
+   * mirando "consultando OSM…" veinticinco segundos para acabar en lo mismo. Diciéndolo ya, la
+   * política de reintentos vuelve a probar cuando el turno se haya liberado.
+   *
+   * Solo vale para lo que el espejo dice de sí mismo. Estar apartado por una petición que falló
+   * es otra cosa: ahí no se sabe cómo está *ahora*, y más vale intentarlo que garantizar que no
+   * se dibuje nada.
+   */
+  if (mirrors.length > 1 && (await probeMirrors(mirrors))) {
+    return { status: 'unavailable' };
+  }
+
+  /**
+   * El plazo es **para toda la búsqueda, no para cada espejo**.
+   *
+   * Por espejo, tres intentos de veinticinco segundos son setenta y cinco de espera antes de
+   * poder decir que no hay datos, y quien mira el mapa no distingue eso de que esté colgado. Un
+   * presupuesto compartido acota lo que el usuario espera pase lo que pase; que un espejo lento
+   * se lleve casi todo es el precio correcto, porque el que responde lo hace en segundos.
+   */
+  const deadline = options.signal ?? AbortSignal.timeout(timeoutMs);
+
+  // Los que acaban de fallar van al final de la cola; ver mirrorsByHealth.
   for (const mirror of mirrorsByHealth(mirrors)) {
+    if (deadline.aborted) break;
     try {
       const response = await fetch(mirror, {
         method: 'POST',
         headers: { 'User-Agent': USER_AGENT },
         body,
-        signal: options.signal ?? AbortSignal.timeout(timeoutMs),
+        signal: deadline,
       });
       if (!response.ok) {
-        mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
+        // 429 y 504 son "estoy ocupado", no "estoy roto".
+        const busy = response.status === 429 || response.status === 504;
+        mirrorBenchedUntil.set(
+          mirror,
+          Date.now() + (busy ? BUSY_COOLDOWN_MS : MIRROR_COOLDOWN_MS),
+        );
         continue;
       }
 
@@ -403,7 +588,8 @@ export async function fetchOnlineStreets(
        * sin calles — y como "sin calles" es definitivo, la zona quedaría marcada para siempre.
        */
       if (payload.remark !== undefined) {
-        mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
+        // Casi siempre "query timed out" o "out of memory": el servidor no daba abasto.
+        mirrorBenchedUntil.set(mirror, Date.now() + BUSY_COOLDOWN_MS);
         continue;
       }
 
@@ -425,11 +611,17 @@ export async function fetchOnlineStreets(
       // Sin red, tiempo agotado, o conexión rechazada. Se aparta y se prueba el siguiente.
       mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
       continue;
-    } finally {
-      mirrorCursor++;
     }
   }
 
+  /**
+   * Nadie pudo servirla, así que lo que se creía de los espejos ya no vale.
+   *
+   * Sin esto, la foto del sondeo se da por buena cinco minutos: la primera zona sondea mientras
+   * el servidor está ocupado, falla, y las siguientes deciden sobre esa foto vieja en vez de
+   * volver a mirar — de modo que siguen fallando un buen rato después de que el turno se liberó.
+   */
+  lastProbeMs = 0;
   return { status: 'unavailable' };
 }
 

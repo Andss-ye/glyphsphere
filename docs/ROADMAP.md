@@ -208,6 +208,37 @@ servicio público real.
    minutos: sin eso la consola se llena de `net::ERR_CONNECTION_REFUSED` y cada intento gasta el
    tiempo del usuario antes de llegar al espejo que sí responde. Si todos están apartados se
    intenta igual — rendirse garantiza no dibujar nada.
+6. **Se pedían 19 MB para producir un tile de 44 KB.** `out geom;` devuelve cada vía con todas sus
+   etiquetas — nombre, superficie, carriles, velocidad, iluminación — y las coordenadas como
+   objetos `{lat, lon}`. Pasando por `convert` para quedarse con una sola etiqueta y geometría
+   GeoJSON, el mismo cuadro baja un 59 %, y con el cuadro al tamaño que el horneado ya había
+   probado (0.07°, no 0.14°) queda en **1.7-3.5 MB**. No es solo ancho de banda: Overpass reparte
+   turnos por IP cobrando el trabajo pedido, así que una consulta obesa se paga en 504 en la
+   siguiente. Medido después: **París entero en 3.7 s**, contra 26-58 s antes.
+7. **El plazo era por espejo, no por búsqueda.** Tres intentos de 25 s son 75 s antes de poder
+   decir que no hay datos, y quien mira el mapa no distingue eso de que esté colgado. Ahora el
+   presupuesto es de toda la búsqueda.
+8. **Rotar el espejo de arranque hacía daño.** Se hizo para repartir carga, pero dos de los tres
+   espejos públicos aceptan la conexión y no contestan: rotar a ciegas repartía peticiones a
+   servidores que cuestan 25 s cada uno. El apartado por salud ya reparte la carga, y lo hace
+   según cómo se están portando de verdad.
+9. **Se descubría que un espejo estaba muerto con la consulta real.** Su endpoint `/api/status`
+   los separa en menos de un segundo — medido, 0.65 s el que funciona contra el plazo agotado en
+   los otros dos — y de paso dice cuándo tendrá turno libre, así que se le cree y se le espera en
+   vez de insistir. Si ninguno tiene turno, se admite al momento en lugar de esperar el plazo
+   entero para acabar en lo mismo.
+
+10. **El sondeo no se identificaba, y se envenenaba solo.** Mismo 406 del punto 2, en el endpoint
+    nuevo: sin `User-Agent` Overpass rechaza también el estado, así que el sondeo daba por muertos
+    a los tres espejos y la búsqueda se rendía en medio segundo teniéndolos todos disponibles. Lo
+    peor fue cómo se escondió: comprobarlo a mano con `curl` decía 200, porque `curl` sí manda un
+    User-Agent. Hay test de regresión.
+
+**Lo que sigue sin depender de nosotros.** Los tres espejos son servidores públicos gratuitos y se
+saturan de verdad: midiéndolos en un mismo minuto, dos aceptaban la conexión sin contestar nunca y
+el tercero repartía turnos. Con todo lo anterior, una ciudad cargada cuesta **2-4 s** y un fallo se
+admite en **0.6-25 s** en vez de en tres minutos; pero que respondan no está en nuestra mano, y por
+eso los tiles horneados son el piso y esto es el extra.
 
 Y una trampa en la que caí eligiendo espejos: `overpass.osm.ch` responde en 0.6 s con 200 y CORS
 correcto, pero es la instancia **suiza** y solo carga Suiza. A Madrid contesta 200 con cero

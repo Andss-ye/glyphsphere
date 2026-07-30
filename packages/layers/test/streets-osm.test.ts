@@ -15,6 +15,7 @@ import {
   isOnline,
   overpassQuery,
   resetMirrorHealth,
+  slotWaitSeconds,
   type OverpassWay,
 } from '../src/index.js';
 
@@ -152,6 +153,26 @@ const respondeCon = (elements: OverpassWay[]) => ({
 });
 
 /**
+ * Un `fetch` falso que atiende el endpoint de estado y delega el resto.
+ *
+ * Con más de un espejo, la búsqueda los sondea antes de consultar — es lo que evita gastar el
+ * plazo entero contra un servidor que no está. Un mock que no lo contemple se come esas llamadas
+ * y hace fallar al test por algo que en producción funciona.
+ */
+function fetchFalso(porUrl: (url: string) => unknown) {
+  return vi.fn().mockImplementation((url: string) => {
+    if (url.endsWith('/status')) {
+      return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
+    }
+    return Promise.resolve(porUrl(url));
+  });
+}
+
+/** Espejos de mentira con la forma real, para que `/interpreter` -> `/status` funcione. */
+const UNO = 'https://uno.invalid/api/interpreter';
+const DOS = 'https://dos.invalid/api/interpreter';
+
+/**
  * Lo que hay que poder afirmar del modo en línea es **negativo**: que nunca sea la razón de que
  * el mapa deje de funcionar. Es un extra sobre lo horneado, así que ningún fallo lanza — todos
  * salen como un estado y dejan al mapa dibujando lo que ya tiene.
@@ -215,18 +236,15 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
   });
 
   it('un espejo que revienta no impide que el siguiente conteste', async () => {
-    const fetchSpy = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ elements: [], remark: 'runtime error: out of memory' }),
-      })
-      .mockResolvedValueOnce(respondeCon([CALLE()]));
-    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    globalThis.fetch = fetchFalso((url) =>
+      url === UNO
+        ? { ok: true, json: async () => ({ elements: [], remark: 'runtime error: out of memory' }) }
+        : respondeCon([CALLE()]),
+    ) as unknown as typeof fetch;
 
     const result = await fetchOnlineStreets(-74.07, 4.65, {
       radiusKm: earth.radiusKm,
-      mirrors: ['https://uno.invalid', 'https://dos.invalid'],
+      mirrors: [UNO, DOS],
     });
     expect(result.status).toBe('ok');
   });
@@ -246,18 +264,18 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
   });
 
   it('prueba el siguiente espejo cuando el primero falla', async () => {
-    const fetchSpy = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('timeout'))
-      .mockResolvedValueOnce(respondeCon([CALLE()]));
+    const fetchSpy = fetchFalso((url) => {
+      if (url === UNO) throw new Error('timeout');
+      return respondeCon([CALLE()]);
+    });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
     const result = await fetchOnlineStreets(-74.07, 4.65, {
       radiusKm: earth.radiusKm,
-      mirrors: ['https://uno.invalid', 'https://dos.invalid'],
+      mirrors: [UNO, DOS],
     });
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(result.status === 'ok' && result.tile.roads).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'))).toHaveLength(2);
   });
 
   it('aparta el espejo que acaba de fallar en vez de volver a él', async () => {
@@ -267,22 +285,20 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
      * antes de llegar al que sí funciona. Y un rechazo no es puntual — Overpass limita por IP
      * durante minutos.
      */
-    const caido = 'https://caido.invalid';
-    const bueno = 'https://bueno.invalid';
-    const fetchSpy = vi.fn().mockImplementation((url: string) => {
-      if (url === caido) return Promise.reject(new Error('ECONNREFUSED'));
-      return Promise.resolve(respondeCon([CALLE()]));
+    const fetchSpy = fetchFalso((url) => {
+      if (url === UNO) throw new Error('ECONNREFUSED');
+      return respondeCon([CALLE()]);
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
-    const mirrors = [caido, bueno];
+    const mirrors = [UNO, DOS];
     for (let i = 0; i < 4; i++) {
       const result = await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors });
       expect(result.status).toBe('ok');
     }
 
     // El caído se prueba una vez y queda apartado; las tres consultas siguientes no lo tocan.
-    expect(fetchSpy.mock.calls.filter(([url]) => url === caido)).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([url]) => url === UNO)).toHaveLength(1);
   });
 
   it('si todos los espejos están apartados, lo intenta igual', async () => {
@@ -299,6 +315,118 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
       .toBe('unavailable');
     expect((await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors })).status)
       .toBe('ok');
+  });
+
+  it('con todos apartados, prueba primero al que menos castigo le queda', async () => {
+    /**
+     * El que agota el plazo sin contestar cuesta veinticinco segundos; el que devuelve 504 cuesta
+     * milisegundos y vuelve antes. Sin ordenarlos, una consulta de tres segundos se convertía en
+     * un minuto de espera porque se probaban primero los colgados.
+     */
+    const colgado = 'https://colgado.invalid';
+    const ocupado = 'https://ocupado.invalid';
+    const fetchSpy = vi.fn().mockImplementation((url: string) => {
+      if (url === colgado) return Promise.reject(new Error('TimeoutError'));
+      return Promise.resolve({ ok: false, status: 504 });
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    // Primera vuelta: los dos fallan. El colgado se aparta 5 min, el ocupado 45 s.
+    const mirrors = [colgado, ocupado];
+    await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors });
+
+    fetchSpy.mockClear();
+    fetchSpy.mockImplementation((url: string) =>
+      url === colgado
+        ? Promise.reject(new Error('TimeoutError'))
+        : Promise.resolve(respondeCon([CALLE()])),
+    );
+
+    const result = await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors });
+    expect(result.status).toBe('ok');
+    // El que menos castigo tenía va primero: se resuelve sin pagar el plazo del colgado.
+    expect(fetchSpy.mock.calls[0]![0]).toBe(ocupado);
+  });
+
+  it('sondea el estado antes de gastar el plazo contra un espejo que no está', async () => {
+    /**
+     * Dos de los tres espejos públicos aceptan la conexión y no contestan nunca. Descubrirlo con
+     * la consulta real cuesta el plazo entero por espejo; su endpoint de estado los separa en
+     * menos de un segundo. Medido: una ciudad que se resuelve en 4 s tardaba más de un minuto en
+     * fallar sin esto.
+     */
+    const fetchSpy = vi.fn().mockImplementation((url: string) => {
+      if (url === `${UNO.replace('/interpreter', '/status')}`) throw new Error('sin respuesta');
+      if (url.endsWith('/status')) {
+        return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
+      }
+      return Promise.resolve(respondeCon([CALLE()]));
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+    });
+    expect(result.status).toBe('ok');
+    // El que no contestó su estado no llega a recibir la consulta.
+    expect(fetchSpy.mock.calls.map(([u]) => u)).not.toContain(UNO);
+  });
+
+  it('si ningún espejo tiene turno, lo admite al momento en vez de esperar el plazo', async () => {
+    // Consultar igual no acelera nada y deja al usuario esperando para acabar en lo mismo.
+    const fetchSpy = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith('/status')) {
+        return Promise.resolve({
+          ok: true,
+          text: async () => 'Slot available after: X, in 90 seconds.',
+        });
+      }
+      return Promise.resolve(respondeCon([CALLE()]));
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+    });
+    expect(result.status).toBe('unavailable');
+    // Ni una consulta: solo los dos sondeos.
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'))).toHaveLength(0);
+  });
+
+  it('el sondeo se identifica, igual que la consulta', async () => {
+    /**
+     * Overpass responde 406 a un User-Agent anónimo, y el de Node lo es. Cuando el sondeo no lo
+     * mandaba, se envenenaba solo: daba por muertos a los tres espejos y la búsqueda se rendía en
+     * medio segundo teniéndolos todos disponibles. El fallo era invisible porque `curl` sí manda
+     * uno, así que comprobarlo a mano decía que todo estaba bien.
+     */
+    const fetchSpy = fetchFalso(() => respondeCon([CALLE()]));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors: [UNO, DOS] });
+
+    const sondeos = fetchSpy.mock.calls.filter(([u]) => String(u).endsWith('/status'));
+    expect(sondeos.length).toBeGreaterThan(0);
+    for (const [, init] of sondeos) {
+      expect((init as RequestInit).headers).toHaveProperty('User-Agent');
+    }
+  });
+
+  it('respeta el turno que el propio espejo anuncia', () => {
+    expect(slotWaitSeconds('2 slots available now.')).toBe(0);
+    expect(
+      slotWaitSeconds('Slot available after: 2026-07-30T22:30:00Z, in 42 seconds.'),
+    ).toBe(42);
+    // Con varias líneas manda la más próxima: es cuando habrá un turno libre.
+    expect(
+      slotWaitSeconds(
+        'Slot available after: X, in 90 seconds.\nSlot available after: Y, in 12 seconds.',
+      ),
+    ).toBe(12);
+    // Un formato que no reconoce no puede traducirse en una espera inventada.
+    expect(slotWaitSeconds('vaya usted a saber')).toBe(0);
   });
 
   it('la misma zona pedida dos veces es el mismo tile, para que la caché acierte', async () => {
