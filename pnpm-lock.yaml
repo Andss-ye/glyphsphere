@@ -115,6 +115,13 @@ importers:
         version: 3.1.0
 
   packages/data:
+    dependencies:
+      '@glyphsphere/bodies':
+        specifier: workspace:*
+        version: link:../bodies
+      '@glyphsphere/layers':
+        specifier: workspace:*
+        version: link:../layers
     devDependencies:
       world-atlas:
         specifier: ^2.0.2
