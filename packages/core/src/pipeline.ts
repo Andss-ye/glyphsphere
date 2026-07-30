@@ -40,6 +40,14 @@ export interface FrameOptions {
     readonly contours?: boolean;
     readonly contourIntervalM?: number | 'auto';
     readonly coastalShadow?: boolean;
+    /**
+     * Ground resolution of the elevation source, in metres per sample. Optional; without it
+     * contours are drawn at every scale, which is the old behaviour.
+     *
+     * With it, contours stop once the screen resolves far finer than the data does — see
+     * CONTOUR_CELLS_PER_SAMPLE.
+     */
+    readonly elevationSourceM?: number;
   };
 }
 
@@ -55,6 +63,15 @@ export interface Pipeline {
   /** Forces the next frame to repaint. For a layer whose data arrived asynchronously. */
   invalidate(): void;
 }
+
+/**
+ * How many cells one elevation sample may span before contours stop being drawn.
+ *
+ * At 16 cells per sample a contour line has fifteen cells of pure interpolation for every real
+ * measurement it touches. Below that ratio the lines still follow measured differences between
+ * neighbouring samples; above it they are drawing the interpolator.
+ */
+const CONTOUR_CELLS_PER_SAMPLE = 16;
 
 /** Everything that changes what the geometry stages produce. */
 interface CacheKey {
@@ -157,7 +174,25 @@ export function createPipeline(cols: number, rows: number): Pipeline {
           // 2. Contours are found from the elevation field and written as CONTOUR linework,
           //    so they reach the grid through the ordinary braille register. They run before
           //    reduce because reduce is what turns linework into glyphs.
-          if (relief?.contours !== false) {
+          /**
+           * Contours are skipped once the screen resolves far finer than the elevation data.
+           *
+           * Below that point every line on screen lies *inside* one heightmap sample, so it
+           * traces the bilinear interpolation rather than the ground: smooth, plausible, and not
+           * a measurement of anything. Over a city it is also actively harmful — those invented
+           * curves are braille, they outnumber the street network, and they bury the one thing on
+           * screen that is real.
+           *
+           * ETOPO1 is 9.8 km per sample, so with the threshold below contours fade out at city
+           * scale and terrain keeps its bands, its shading and its coastal shadow. The camera
+           * reaches further than this dataset does; saying so is better than drawing over it.
+           */
+          const sourceM = relief?.elevationSourceM;
+          const resolvable =
+            sourceM === undefined ||
+            projection.metersPerCell() * CONTOUR_CELLS_PER_SAMPLE >= sourceM;
+
+          if (relief?.contours !== false && resolvable) {
             const interval =
               relief?.contourIntervalM === undefined || relief.contourIntervalM === 'auto'
                 ? adaptiveIntervalM(camera.altitudeKm, riseM)

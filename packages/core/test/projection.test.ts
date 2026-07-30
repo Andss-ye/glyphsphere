@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildProjection } from '../src/projection/satellite.js';
-import { createViewMetrics, discRadiusRows } from '../src/projection/aspect.js';
+import { createViewMetrics, groundAngleRad, viewportHalfRows } from '../src/projection/aspect.js';
 import { cameraDistance, horizonAngleRad } from '../src/projection/visibility.js';
 import { createCameraState } from '../src/camera/state.js';
 import { smallBody, testBody } from './fixtures.js';
@@ -65,32 +65,127 @@ describe('derivation from docs/CAMERA.md', () => {
   });
 });
 
+/**
+ * The camera-to-surface relation the field of view rests on: a ray leaving the camera at `alpha`
+ * off the optical axis meets the ground `c` radians from the sub-camera point, with
+ * `sin(alpha + c) = P sin(alpha)`.
+ */
+describe('groundAngleRad', () => {
+  const body = testBody();
+
+  it('the optical axis hits the sub-camera point', () => {
+    for (const P of [1.001, 1.5, 2, 10]) {
+      expect(groundAngleRad(P, 0)).toBeCloseTo(0, 12);
+    }
+  });
+
+  it('the horizon ray lands on the horizon', () => {
+    // alpha_horizon = asin(1/P), and the ground angle there is acos(1/P) — the same horizon the
+    // visibility test uses, arrived at from the camera side instead of the tangent side.
+    for (const altitudeKm of [1, 400, 6_371, 80_000]) {
+      const P = cameraDistance(body, altitudeKm);
+      expect(groundAngleRad(P, Math.asin(1 / P))).toBeCloseTo(horizonAngleRad(body, altitudeKm), 9);
+    }
+  });
+
+  it('never reports ground past the horizon, however wide the ray', () => {
+    const P = cameraDistance(body, 400);
+    const horizon = horizonAngleRad(body, 400);
+    for (const alphaDeg of [0.1, 30, 60, 89.9]) {
+      expect(groundAngleRad(P, alphaDeg / DEG)).toBeLessThanOrEqual(horizon + 1e-12);
+    }
+  });
+
+  it('grows with the angle off axis', () => {
+    const P = cameraDistance(body, 400);
+    let previous = -1;
+    for (const alphaDeg of [0, 0.5, 1, 2, 4]) {
+      const c = groundAngleRad(P, alphaDeg / DEG);
+      expect(c).toBeGreaterThan(previous);
+      previous = c;
+    }
+  });
+
+  it('reduces to the flat-earth pinhole close in: s = h tan(alpha)', () => {
+    // Close to the surface and near the axis, curvature is negligible and the ground distance is
+    // just the altitude times the tangent — the relation that makes the scale track altitude.
+    const altitudeKm = 2;
+    const P = cameraDistance(body, altitudeKm);
+    for (const alphaDeg of [1, 5, 10]) {
+      const alpha = alphaDeg / DEG;
+      const arcKm = groundAngleRad(P, alpha) * body.radiusKm;
+      expect(arcKm).toBeCloseTo(altitudeKm * Math.tan(alpha), 2);
+    }
+  });
+});
+
 describe('disc size', () => {
   const body = testBody();
 
-  // Fase 1 done-criteria: the disc is the right size at any altitude.
-  it.each([0.5, 5, 400, 2_000, 20_000, 80_000])(
-    'puts the limb at the disc radius at %i km',
-    (altitudeKm) => {
+  /**
+   * Altitude at which the body stops overflowing the frame and starts fitting inside it:
+   * `P = 1/sin(fov/2)`, so `altitude = R * (1/sin(fov/2) - 1)`. With the default 60 degree lens
+   * that is exactly one body radius.
+   */
+  const crossoverKm = body.radiusKm * (1 / Math.sin(view.fovDeg / 2 / DEG) - 1);
+
+  /** Where the limb lands, in row units from the view centre. */
+  function limbRadiusRows(altitudeKm: number): number {
+    const projection = buildProjection(body, cameraAt(altitudeKm), view);
+    // Camera sits at (0,0), so a point at lon = c is exactly c degrees away along the equator.
+    const cell = projection.toCell([projection.clipAngleDeg * 0.99999, 0]);
+    expect(cell).not.toBeNull();
+    return radiusFromCentreRows(cell!, view.cols, view.rows, view.cellAspect);
+  }
+
+  // Above the crossover the body fits the frame, and the original Fase 1 criterion still holds
+  // exactly: the limb touches the viewport edge.
+  it.each([20_000, 80_000])('puts the limb at the viewport edge at %i km', (altitudeKm) => {
+    expect(altitudeKm).toBeGreaterThan(crossoverKm);
+    expect(limbRadiusRows(altitudeKm)).toBeCloseTo(viewportHalfRows(view), 2);
+  });
+
+  // Below it the lens is narrower than the horizon, so the limb is off screen. That is the whole
+  // point of the field of view: the frame stops chasing the horizon and starts holding a scale.
+  it.each([0.5, 5, 400, 2_000])('puts the limb beyond the viewport at %i km', (altitudeKm) => {
+    expect(altitudeKm).toBeLessThan(crossoverKm);
+    expect(limbRadiusRows(altitudeKm)).toBeGreaterThan(viewportHalfRows(view));
+  });
+
+  it('reports where the limb is, at every altitude', () => {
+    for (const altitudeKm of [0.5, 5, 400, 2_000, 20_000, 80_000]) {
       const projection = buildProjection(body, cameraAt(altitudeKm), view);
+      expect(limbRadiusRows(altitudeKm)).toBeCloseTo(projection.radiusRows, 2);
+    }
+  });
 
-      // Camera sits at (0,0), so a point at lon = c is exactly c degrees away along the equator.
-      const nearLimb: [number, number] = [projection.clipAngleDeg * 0.99999, 0];
-      const cell = projection.toCell(nearLimb);
-      expect(cell).not.toBeNull();
+  it('the limb closes in monotonically as the camera climbs', () => {
+    const radii = [0.5, 5, 400, 2_000, 20_000, 80_000].map(limbRadiusRows);
+    for (let i = 1; i < radii.length; i++) {
+      expect(radii[i]!).toBeLessThanOrEqual(radii[i - 1]! + 1e-6);
+    }
+    // And it never shrinks past the viewport: the body cannot be framed smaller than it is.
+    expect(Math.min(...radii)).toBeCloseTo(viewportHalfRows(view), 2);
+  });
 
-      const r = radiusFromCentreRows(cell!, view.cols, view.rows, view.cellAspect);
-      expect(r).toBeCloseTo(discRadiusRows(view), 2);
-    },
-  );
+  it('the framing is continuous across the crossover — no jump in scale', () => {
+    /**
+     * At the crossover the viewport edge ray is exactly tangent to the horizon, which is where
+     * `asin` has a vertical tangent — so the *slope* of the scale changes abruptly while the
+     * *value* does not. Testing it at a fixed step would therefore measure the kink, not a jump.
+     * Continuity is the statement that the two sides converge as the step shrinks, so that is
+     * what gets asserted.
+     */
+    const gap = (eps: number): number => {
+      const below = buildProjection(body, cameraAt(crossoverKm * (1 - eps)), view).metersPerCell();
+      const above = buildProjection(body, cameraAt(crossoverKm * (1 + eps)), view).metersPerCell();
+      return Math.abs(1 - below / above);
+    };
 
-  it('the disc radius does not drift with altitude', () => {
-    const radii = [1, 400, 80_000].map((alt) => {
-      const projection = buildProjection(body, cameraAt(alt), view);
-      const cell = projection.toCell([projection.clipAngleDeg * 0.99999, 0])!;
-      return radiusFromCentreRows(cell, view.cols, view.rows, view.cellAspect);
-    });
-    for (const r of radii) expect(r).toBeCloseTo(radii[0]!, 2);
+    const coarse = gap(1e-3);
+    const fine = gap(1e-9);
+    expect(fine).toBeLessThan(coarse);
+    expect(fine).toBeLessThan(0.01);
   });
 
   it('the view centre projects to the centre of the grid', () => {

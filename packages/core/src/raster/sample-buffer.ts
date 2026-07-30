@@ -35,6 +35,8 @@ export const LINE_CLASS = {
   BORDER: 4,
   ROAD: 5,
   GRATICULE: 6,
+  /** Edge of a built-up area. Context under the roads, so it reads dimmer than one. */
+  URBAN: 8,
   CUSTOM_1: 200,
   CUSTOM_2: 201,
 } as const;

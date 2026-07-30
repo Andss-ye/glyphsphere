@@ -11,5 +11,9 @@
   },
   "devDependencies": {
     "world-atlas": "^2.0.2"
+  },
+  "dependencies": {
+    "@glyphsphere/bodies": "workspace:*",
+    "@glyphsphere/layers": "workspace:*"
   }
 }

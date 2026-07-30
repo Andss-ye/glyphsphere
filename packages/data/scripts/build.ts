@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { buildRelief } from './build-relief.js';
 import { buildPlaces } from './build-places.js';
 import { buildHydro } from './build-hydro.js';
+import { buildUrban } from './build-urban.js';
+import { buildStreets } from './build-streets.js';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -76,6 +78,8 @@ async function build(): Promise<void> {
   await buildRelief();
   await buildPlaces();
   await buildHydro();
+  await buildUrban();
+  await buildStreets();
 }
 
 await build();

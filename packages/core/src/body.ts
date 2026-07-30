@@ -83,4 +83,6 @@ export interface DatasetManifest {
   /** Rivers and lakes. Absent on a body with no hydrosphere. */
   readonly hydro?: Partial<Record<LodLevel, string>>;
   readonly borders?: Partial<Record<LodLevel, string>>;
+  /** Road network and built-up footprint, for the levels close enough to show them. */
+  readonly urban?: Partial<Record<LodLevel, string>>;
 }

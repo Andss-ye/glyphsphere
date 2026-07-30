@@ -40,22 +40,40 @@ export interface SampleContext {
    */
   fillElevationField(sampleAt: (lon: number, lat: number) => number): void;
 
-  /** Declares a linear feature. Width is in subcells, not pixels. */
+  /**
+   * Declares a linear feature. Width is in subcells, not pixels.
+   *
+   * `dense` is an assertion about the *geometry*, not a quality setting: it says this geometry
+   * spans a patch small enough that the projection over it is affine to within d3's own
+   * resampling precision, so resampling cannot move anything into a different subcell. Skipping
+   * it measured 30 % off the street layer's cost (5.8 ms -> 4.0 ms over Bogotá).
+   *
+   * It is emphatically **not** "the vertices are closer than a subcell" — street data simplified
+   * at bake time emits chords up to 6.5 km long down a straight avenue, and it is still exact.
+   * What makes it exact is the extent of the whole patch, not the spacing within it. Asserting it
+   * for geometry that crosses the globe draws arcs as chords, so it is wrong for a coastline, a
+   * border or a graticule, and `streets.test.ts` pins the one caller that does claim it by
+   * comparing every subcell against the resampled frame.
+   */
   strokeLine(
     geometry: GeoPermissibleObjects,
     lineClass: LineClass | number,
     widthSubcells?: number,
+    dense?: boolean,
   ): void;
 }
 
 /**
- * Subcells between exact inverse projections in `fillElevationField`.
+ * Subcells between exact inverse projections in `fillElevationField`, in the two regimes the
+ * projection actually has. See the table at the point of use for the measurements behind them.
  *
- * The heightmap is sampled once per subcell, and un-projecting each one measured 4.83 ms of the
- * layer's 5.4 ms — the bilinear sample itself was 0.46 ms. The inverse is smooth away from the
- * limb, so it is evaluated at span endpoints and interpolated between, which is 8x fewer calls.
+ * Un-projecting every subcell is what the field costs: measured on a 202x63 grid, the inverse
+ * projection is 4.9 ms of the layer's 5.4 ms while the bilinear heightmap read is only 0.4 ms.
+ * The inverse is smooth away from the limb, so it is evaluated at span endpoints and interpolated
+ * between.
  */
-const FIELD_SPAN_SUBCELLS = 8;
+const SPAN_WITH_LIMB = 8;
+const SPAN_NO_LIMB = 64;
 
 
 export type LayerKind = 'geometry' | 'point' | 'overlay';
@@ -113,6 +131,22 @@ export function createSampleContext(
   const sink = new PathSink(correctX, centreX);
   const path = geoPath(subProjection, sink);
 
+  /**
+   * The same path with resampling off, for geometry that is already finer than a subcell.
+   *
+   * Built on demand and thrown away with the context: most frames never draw dense geometry, and
+   * the layers that do are the ones under the frame-budget pressure that motivated this.
+   */
+  let densePath: typeof path | null = null;
+  const denseFor = (): typeof path => {
+    if (densePath === null) {
+      // A second instance, because precision is per-projection: the coastline in the same frame
+      // still needs resampling, and turning it off for everyone draws continents as polygons.
+      densePath = geoPath(projection.subcellProjection(buffer.subX, buffer.subY).projection.precision(0), sink);
+    }
+    return densePath;
+  };
+
   return {
     buffer,
     projection,
@@ -142,6 +176,32 @@ export function createSampleContext(
       const exactAt = (sx: number, cellY: number): [number, number] | null =>
         projection.fromCell([(sx + 0.5) / subX, cellY]) as [number, number] | null;
 
+      /**
+       * How many subcells one interpolated span covers.
+       *
+       * A span that fails the linearity check below falls back to un-projecting every subcell in
+       * it, so the width is a two-sided bet: too narrow wastes probes where the inverse is
+       * smooth, too wide pays the fallback over a long run where it is not. There is exactly one
+       * place the inverse is not smooth — the limb, where it is singular — so the width follows
+       * whether the limb is on screen at all.
+       *
+       * With a lens narrower than the horizon the limb is outside the viewport entirely and the
+       * inverse is smooth across the whole frame, which is what wide spans are for. Measured over
+       * Bogota, per call, on a 202x63 grid:
+       *
+       *            20 000 km   2 000 km    150 km      1 km      (limb: in frame | off screen)
+       *   span  8     2.8 ms     5.4 ms    5.1 ms    5.3 ms
+       *   span 64     7.9 ms    16.0 ms    2.5 ms    2.5 ms
+       *
+       * Switching on the limb takes the better column in every case.
+       */
+      const halfDiagonalRows = Math.hypot(
+        (projection.view.cols * projection.view.cellAspect) / 2,
+        projection.view.rows / 2,
+      );
+      const span =
+        projection.radiusRows > halfDiagonalRows ? SPAN_NO_LIMB : SPAN_WITH_LIMB;
+
       for (let sy = 0; sy < height; sy++) {
         const cellY = (sy + 0.5) / subY;
         const rowStart = sy * width;
@@ -150,8 +210,8 @@ export function createSampleContext(
         let left: [number, number] | null = null;
         let leftX = -1;
 
-        for (let x0 = 0; x0 < width; x0 += FIELD_SPAN_SUBCELLS) {
-          const x1 = Math.min(width - 1, x0 + FIELD_SPAN_SUBCELLS);
+        for (let x0 = 0; x0 < width; x0 += span) {
+          const x1 = Math.min(width - 1, x0 + span);
 
           // Only where the body is: inverting off-disc coordinates is wasted work, and there
           // is no ground there to have a height.
@@ -189,16 +249,23 @@ export function createSampleContext(
             const mid = exactAt((x0 + x1) >> 1, cellY);
             if (mid !== null) {
               const toleranceDeg =
-                Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1])) /
-                (2 * FIELD_SPAN_SUBCELLS);
+                Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1])) / (2 * span);
               linear =
                 Math.abs(mid[0] - (a[0] + b[0]) / 2) <= toleranceDeg &&
                 Math.abs(mid[1] - (a[1] + b[1]) / 2) <= toleranceDeg;
             }
           }
 
+          /**
+           * Spans share their endpoint — `x1` of one is `x0` of the next — because the inverse
+           * is carried across to save a projection. Only the *interpolation* wants that overlap;
+           * writing it too made every span boundary get sampled twice, which measured 114 408
+           * heightmap samples for 101 808 subcells. So each span writes half-open, and only the
+           * final one, which has nothing after it, closes on its right endpoint.
+           */
           const width0 = x1 - x0;
-          for (let sx = x0; sx <= x1; sx++) {
+          const lastSubcell = x1 === width - 1 ? x1 : x1 - 1;
+          for (let sx = x0; sx <= lastSubcell; sx++) {
             const index = rowStart + sx;
             if (bodyMask[index] === 0) continue;
 
@@ -222,9 +289,9 @@ export function createSampleContext(
       }
     },
 
-    strokeLine(geometry, lineClass, widthSubcells = 1) {
+    strokeLine(geometry, lineClass, widthSubcells = 1, dense = false) {
       sink.beginPath();
-      path(geometry);
+      (dense ? denseFor() : path)(geometry);
       strokeRings(
         sink.result,
         buffer.lineMask,

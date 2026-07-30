@@ -52,37 +52,56 @@ const WATER_GLYPHS = new Set([' ', '·', '~']);
 const COLS = 200;
 const ROWS = 60;
 
-function classify(
-  centre: { lon: number; lat: number; altitudeKm: number },
-  points: readonly (readonly [string, number, number])[],
-): Map<string, 'tierra' | 'agua' | 'fuera'> {
+/**
+ * Judges one place with the camera **centred on it**.
+ *
+ * The earlier version placed one camera and read every city off that single frame, which quietly
+ * coupled this test to how wide the projection frames. It passed only because the framing used to
+ * fit the whole visible hemisphere; once the camera gained a field of view, Orlando, New Orleans
+ * and Atlanta fell outside the viewport — and `grid.get` returns glyph 0 out of bounds, which
+ * `String.fromCodePoint(0 || 32)` turned into a space, which this test reads as water. So three
+ * cities off screen reported as "the sea", which is the wrong answer to the right question.
+ *
+ * Centring per place asks what the test means to ask — is this spot land? — and cannot be moved
+ * by a framing change again.
+ */
+function classifyOne(lon: number, lat: number, altitudeKm: number): 'tierra' | 'agua' {
   const view = createViewMetrics(COLS, ROWS);
   const grid = new Grid(COLS, ROWS);
   const pipeline = createPipeline(COLS, ROWS);
   const stack = new LayerStack(defaultLayers(earth, { land, heightmap }));
-  const camera = createCameraState(earth.id, centre);
+  const camera = createCameraState(earth.id, { lon, lat, altitudeKm });
 
   pipeline.render({ scene: singleBodyScene(earth), camera, view, grid, stack });
   const projection = buildProjection(earth, camera, view);
 
-  const out = new Map<string, 'tierra' | 'agua' | 'fuera'>();
+  const cell = projection.toCell([lon, lat]);
+  if (!cell) throw new Error(`${lon},${lat} no proyecta con la cámara centrada en ello`);
+
+  const x = Math.round(cell[0]);
+  const y = Math.round(cell[1]);
+  if (x < 0 || x >= COLS || y < 0 || y >= ROWS) {
+    throw new Error(`${lon},${lat} cae fuera del viewport con la cámara centrada en ello`);
+  }
+
+  const glyph = String.fromCodePoint(grid.get(x, y).glyph || 32);
+  const code = glyph.codePointAt(0)!;
+
+  // Braille means a line runs through the cell — a coast or a contour — which says nothing
+  // about which side of the shore the cell is on. Judge those by the ground height instead.
+  const isBraille = code >= 0x2800 && code <= 0x28ff;
+  return (isBraille ? heightmap.sample(lon, lat) < 0 : WATER_GLYPHS.has(glyph))
+    ? 'agua'
+    : 'tierra';
+}
+
+function classify(
+  centre: { altitudeKm: number },
+  points: readonly (readonly [string, number, number])[],
+): Map<string, 'tierra' | 'agua'> {
+  const out = new Map<string, 'tierra' | 'agua'>();
   for (const [name, lon, lat] of points) {
-    const cell = projection.toCell([lon, lat]);
-    if (!cell) {
-      out.set(name, 'fuera');
-      continue;
-    }
-
-    const glyph = String.fromCodePoint(
-      grid.get(Math.round(cell[0]), Math.round(cell[1])).glyph || 32,
-    );
-    const code = glyph.codePointAt(0)!;
-
-    // Braille means a line runs through the cell — a coast or a contour — which says nothing
-    // about which side of the shore the cell is on. Judge those by the ground height instead.
-    const isBraille = code >= 0x2800 && code <= 0x28ff;
-    const water = isBraille ? heightmap.sample(lon, lat) < 0 : WATER_GLYPHS.has(glyph);
-    out.set(name, water ? 'agua' : 'tierra');
+    out.set(name, classifyOne(lon, lat, centre.altitudeKm));
   }
   return out;
 }

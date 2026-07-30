@@ -6,6 +6,7 @@ import {
   boundingCap,
   capIsVisible,
   capRuns,
+  resolveLine,
   resolveRing,
   type Cap,
   type RunIndexedRing,
@@ -176,7 +177,15 @@ export function visiblePolygons(
   return { type: 'FeatureCollection', features };
 }
 
-/** The outline segments that reach the view, thinned the same way. */
+/**
+ * The outline segments that reach the view.
+ *
+ * A coastline that is off screen contributes nothing to a *stroke* — unlike a fill, a line has no
+ * interior to preserve — so `resolveLine` drops the far runs entirely instead of thinning them,
+ * splitting the outline into separate polylines where it leaves the view. On land-10m over a
+ * dense coast that is the difference between streaming the far side of a continent every frame
+ * and streaming none of it.
+ */
 export function visibleLines(
   lines: readonly CulledLine[],
   view: ViewCap,
@@ -184,12 +193,14 @@ export function visibleLines(
 ): MultiLineString {
   linePool.reset();
   const coordinates: Position[][] = [];
+  const emit = (segment: Position[]): void => {
+    coordinates.push(segment);
+  };
+  const take = (): Position[] => linePool.take();
+
   for (const line of lines) {
     if (!capIsVisible(line.cap, view)) continue;
-    // A coastline that is off screen contributes nothing to a *stroke* — unlike a fill, a line
-    // has no interior to preserve — so far runs are thinned rather than kept.
-    const resolved = resolveRing(line.ring, view, subcellRad, linePool.take());
-    if (resolved.length >= 2) coordinates.push(resolved);
+    resolveLine(line.ring, view, subcellRad, take, emit);
   }
   return { type: 'MultiLineString', coordinates };
 }

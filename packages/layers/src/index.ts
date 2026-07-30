@@ -16,6 +16,7 @@ export {
   capFeatures,
   capRuns,
   resolveRing,
+  resolveLine,
   RUN_LENGTH,
   FAR_STRIDE,
   type Cap,
@@ -36,6 +37,45 @@ export {
 export { bordersLayer, type BordersOptions } from './geometry/borders.js';
 export { graticuleLayer, type GraticuleOptions } from './geometry/graticule.js';
 export { hydroLayer, type HydroOptions } from './geometry/hydro.js';
+export { urbanLayer, type UrbanOptions } from './geometry/urban.js';
+export { streetsLayer, type StreetsOptions } from './geometry/streets.js';
+export {
+  decodeStreets,
+  encodeStreets,
+  gridSizeFor,
+  loadStreetTile,
+  simplifyQuantized,
+  tileAt,
+  QUANT_M,
+  SIMPLIFY_M,
+  type EncodableWay,
+  type Street,
+  type StreetTile,
+  type StreetTileMeta,
+  type StreetsMeta,
+} from './loaders/streets-bin.js';
+export {
+  CLASS_NAMES,
+  OSM_META,
+  ROAD_CLASSES,
+  STREAM_CLASS,
+  WATER_CLASS,
+  chainWays,
+  classOf,
+  createOnlineStreetSource,
+  encodeOsmStreets,
+  fetchOnlineStreets,
+  isOnline,
+  onlineTileAt,
+  overpassQuery,
+  resetMirrorHealth,
+  type OnlineStatus,
+  type OnlineStreetSourceOptions,
+  type OnlineStreetsOptions,
+  type OnlineStreetsResult,
+  type OverpassWay,
+} from './loaders/streets-osm.js';
+export { prepareThinned, selectThinned, type ThinnedFeature } from './geometry/thinned.js';
 export { placesLayer, visiblePlaces, type PlacesOptions } from './point/places.js';
 export { cityLabels, type CityLabel, type CityLabelOptions } from './overlay/labels.js';
 export {
