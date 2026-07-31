@@ -47,27 +47,46 @@ function fieldRun(altitudeKm: number) {
 
 describe('fillElevationField', () => {
   it.each([80_000, 20_000, 2_000, 150, 1])(
-    'samples each on-body subcell exactly once at %i km',
+    'nunca muestrea más veces que subceldas hay, a %i km',
     (altitudeKm) => {
       const { onBody, calls } = fieldRun(altitudeKm);
 
       expect(onBody).toBeGreaterThan(0);
       /**
-       * Regression guard. Spans share an endpoint so the inverse projection can be carried from
-       * one to the next, and that overlap used to be *written* as well as interpolated — every
-       * span boundary got sampled twice, 114 408 samples for 101 808 subcells on a real frame.
-       * Sampling is the frame's hot path; a duplicate is pure waste.
+       * Guarda de regresión. Los spans comparten extremo para poder arrastrar la inversa de uno
+       * al siguiente, y ese solape llegó a *escribirse* además de interpolarse: cada frontera de
+       * span se muestreaba dos veces, 114 408 muestras para 101 808 subceldas en un cuadro real.
+       * Muestrear es el camino caliente del frame; una muestra repetida es desperdicio puro.
+       *
+       * El límite es "no más que subceldas", no "exactamente una por subcelda": donde el terreno
+       * es liso dentro de un span, la altura se interpola y se muestrea mucho menos — ver abajo.
        */
-      expect(calls).toBe(onBody);
+      expect(calls).toBeLessThanOrEqual(onBody);
     },
   );
+
+  it('sobre un campo liso muestrea bastante menos que subceldas hay', () => {
+    /**
+     * El contrato de la optimización: sobre una ciudad a decenas de metros por celda, la pantalla
+     * entera cabe en un par de texels de ETOPO1 — 9.8 km de lado — así que muestrear cada subcelda
+     * es remuestrear un plano.
+     *
+     * El margen es holgado a propósito. La interpolación de altura solo se intenta donde la
+     * *proyección* ya resultó lineal, y en esta rejilla el span pegado al borde no lo es, así que
+     * ese trozo se muestrea exacto — como debe. La cifra que importa está medida sobre datos y
+     * rejilla reales en `packages/layers/bench/zoom-sweep.ts`: la capa de relieve pasa de ~2.9 ms
+     * a ~2.3 ms en zoom de ciudad.
+     */
+    const { onBody, calls } = fieldRun(1);
+    expect(calls).toBeLessThan(onBody * 0.75);
+  });
 
   it('never samples a subcell that is off the body', () => {
     // At high altitude the body does not fill the frame, so this is a real constraint: inverting
     // off-disc coordinates is wasted work and there is no ground there to have a height.
     const { onBody, calls, buffer } = fieldRun(80_000);
     expect(onBody).toBeLessThan(buffer.width * buffer.height);
-    expect(calls).toBe(onBody);
+    expect(calls).toBeLessThanOrEqual(onBody);
   });
 
   it('leaves the elevation of off-body subcells untouched', () => {

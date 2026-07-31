@@ -471,18 +471,19 @@ describe('la política de cortesía del origen en línea', () => {
 
   const nunca = { radiusKm: earth.radiusKm, mirrors: ['https://ejemplo.invalid/api'] };
 
-  it('llamar sesenta veces por frame produce UNA consulta', async () => {
-    let resolver: ((value: unknown) => void) | undefined;
-    const fetchSpy = vi.fn().mockReturnValue(new Promise((r) => (resolver = r)));
+  it('llamar sesenta veces por frame no dispara sesenta consultas', async () => {
+    /**
+     * Se permiten dos a la vez — es lo que el propio Overpass anuncia como límite por IP — pero
+     * ni una más, y desde luego no una por cuadro de render.
+     */
+    const fetchSpy = vi.fn().mockReturnValue(new Promise(() => {}));
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
     const source = createOnlineStreetSource(nunca);
-    for (let i = 0; i < 60; i++) source.request(-3.7038, 40.4168, 1);
+    for (let i = 0; i < 60; i++) source.request(-3.7038, 40.4168, 1, 0.5);
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'))).toHaveLength(2);
     expect(source.status).toBe('fetching');
-
-    resolver!(respondeCon([CALLE()]));
   });
 
   it('un fallo rápido no dispara otra consulta en el frame siguiente', async () => {

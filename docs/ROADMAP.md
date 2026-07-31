@@ -173,6 +173,27 @@ trick if profiling shows this is over budget on a real grid size"*). Lo mostró.
 - **El panel se actualiza a 8 Hz, no a 60.** Son una veintena de escrituras al DOM para mostrar
   números que nadie lee sesenta veces por segundo.
 
+#### El consumo: lo que se paga por segundo, no por cuadro
+
+Se reportó que el portátil se calentaba enseguida. Midiendo **en la rejilla real** apareció el
+error de método que lo escondía: los benches usaban 150x40 o 200x60 y daban 4-6 ms, mientras una
+ventana de 1080p con celda de 14 px son 274x77 — casi el doble de celdas — y ahí el mismo frame
+cuesta 8-12 ms. Una rejilla de bench chica no da una medida optimista: da otra medida.
+
+Tres cambios, por orden de impacto:
+
+1. **Como mucho 30 cuadros por segundo mientras algo se mueve.** Es la palanca que más baja el
+   consumo y con diferencia: exactamente la mitad del trabajo, y en un mapa de celdas de 7x14 px
+   arrastrar a 30 fps se siente igual. En reposo no cambia nada, el bucle ya se detenía solo.
+2. **La altura también se interpola por spans.** El campo de elevación se muestreaba una vez por
+   subcelda — 168 000 veces en 1080p — cuando sobre una ciudad a 33 m por celda la pantalla entera
+   cabe en un par de texels de ETOPO1, que son 9.8 km. Ahora se lee en los extremos del span y se
+   comprueba en tres puntos que la línea recta los explica dentro de un metro; donde el terreno sí
+   gira, la comprobación falla y se muestrea exacto. `relief` pasa de ~2.9 ms a ~2.3 ms en zoom de
+   ciudad, y no cambia en órbita, que es donde el terreno de verdad varía.
+3. **Los cuadros de calles se consultan cinco veces por segundo, no sesenta.** Decidir cuáles
+   hacen falta cuesta una proyección y una lista ordenada, y una descarga tarda segundos.
+
 Y dos más, sobre la comparación entre cuadros:
 
 - **Se compara de palabra en palabra, no de byte en byte.** Una celda son exactamente cuatro
@@ -253,6 +274,10 @@ servicio público real.
 12. **El panel afirmaba que había datos donde no los había.** Sumaba todos los tiles cargados, así
     que decía "Medellín, 3 400 vías" estando sobre Buenos Aires. Ahora cuenta solo los que cubren
     el punto bajo la cámara.
+
+13. **Se pedía un cuadro por vez y la ciudad se llenaba a medias.** Ahora dos, que es lo que el
+    propio Overpass anuncia como límite por IP en su endpoint de estado. Más no trae nada antes:
+    encola y consume la cuota.
 
 Queda una limitación honesta: a 25 km de altitud cubrir la vista entera serían ~49 consultas, que
 no se le piden a un servicio gratuito. La cobertura en línea es completa desde unos 10 km hacia

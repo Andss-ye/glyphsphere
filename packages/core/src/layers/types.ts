@@ -75,6 +75,31 @@ export interface SampleContext {
 const SPAN_WITH_LIMB = 8;
 const SPAN_NO_LIMB = 64;
 
+/**
+ * Dónde se comprueba que la altura varía linealmente dentro de un span.
+ *
+ * Tres puntos y no solo el medio: una cresta simétrica respecto del centro pasaría desapercibida
+ * mirando únicamente el punto medio, y saldría aplanada.
+ */
+const PROBE_FRACTIONS = [0.25, 0.5, 0.75];
+
+/**
+ * Span mínimo para que valga la pena comprobar si la altura es lineal.
+ *
+ * Comprobarlo cuesta cinco lecturas (dos extremos y tres sondeos), así que por debajo de esto se
+ * gastaría casi tanto como se ahorra — y con el limbo en cuadro los spans son de ocho subceldas,
+ * donde sería directamente una pérdida.
+ */
+const MIN_SPAN_FOR_HEIGHT_LERP = 16;
+
+/**
+ * Cuánto puede desviarse la altura interpolada de la real, en metros.
+ *
+ * El campo se guarda como enteros de metros, así que por debajo de uno la diferencia ni siquiera
+ * se puede registrar — mucho menos verse en una banda o en una curva de nivel.
+ */
+const HEIGHT_TOLERANCE_M = 1;
+
 
 export type LayerKind = 'geometry' | 'point' | 'overlay';
 
@@ -263,11 +288,53 @@ export function createSampleContext(
            * heightmap samples for 101 808 subcells. So each span writes half-open, and only the
            * final one, which has nothing after it, closes on its right endpoint.
            */
+          /**
+           * The same trick again, one level up: interpolate the **height** across the span too.
+           *
+           * Sampling the source per subcell is only worth it where the source has something to
+           * say at that scale. Over a city at 33 m per cell the whole screen sits inside a couple
+           * of ETOPO1 texels — nine point eight kilometres apart — so those 168 000 bilinear
+           * reads are resampling a field that is, at that size, a plane. Measured, they were the
+           * bulk of the relief layer's cost.
+           *
+           * Checked rather than assumed, like the projection above: the height is read at the two
+           * ends and at three points between, and the span is only interpolated when all three
+           * match the straight line to within a metre — which is below what an Int16 of metres
+           * can even record, let alone what a band or a contour can show. Where the ground really
+           * does turn inside one span the check fails and every subcell is sampled, so the cost
+           * only drops where the detail was not there to begin with.
+           */
           const width0 = x1 - x0;
+          let heightLinear = false;
+          let heightA = 0;
+          let heightB = 0;
+          if (linear && width0 >= MIN_SPAN_FOR_HEIGHT_LERP) {
+            const lonA = a![0];
+            const latA = a![1];
+            const dLon = b![0] - lonA;
+            const dLat = b![1] - latA;
+            heightA = sampleAt(lonA, latA);
+            heightB = sampleAt(lonA + dLon, latA + dLat);
+            heightLinear = true;
+            for (const t of PROBE_FRACTIONS) {
+              const probed = sampleAt(lonA + dLon * t, latA + dLat * t);
+              if (Math.abs(probed - (heightA + (heightB - heightA) * t)) > HEIGHT_TOLERANCE_M) {
+                heightLinear = false;
+                break;
+              }
+            }
+          }
+
           const lastSubcell = x1 === width - 1 ? x1 : x1 - 1;
           for (let sx = x0; sx <= lastSubcell; sx++) {
             const index = rowStart + sx;
             if (bodyMask[index] === 0) continue;
+
+            if (heightLinear) {
+              const t = width0 === 0 ? 0 : (sx - x0) / width0;
+              elevation[index] = heightA + (heightB - heightA) * t;
+              continue;
+            }
 
             let lon: number;
             let lat: number;

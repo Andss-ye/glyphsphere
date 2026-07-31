@@ -176,12 +176,15 @@ Medidos, no estimados. Tablas y método en `docs/ROADMAP.md`.
    altitud depende del campo de visión y del tamaño de la rejilla; la escala es la magnitud real.
    Y no filtres geometría por su longitud: OSM parte las vías en las intersecciones, así que
    descartar tramos cortos borra la red en vez de despejarla.
-3. **El presupuesto de 10 ms se cumple hoy, con poco margen.** Peor caso medido 9.1 ms (Tokio a
-   0.2 km) y 9.1 ms (Nueva York a 400 km, donde manda `landmask`); el resto del descenso sobre las
-   tres ciudades va de 4.8 a 8.5 ms. Lo que queda por optimizar es `land-10m` en `landmask`, y el
-   arreglo de fondo es tiling. No supongas que estás dentro de presupuesto porque tu capa sea
-   barata — **medí el stack completo**, con la cámara en movimiento (una cámara quieta usa la
-   caché de geometría y no mide nada).
+3. **Medí en la rejilla que ve el usuario, no en una cómoda.** Es el error que más caro salió:
+   los benches usaban 150x40 o 200x60 y reportaban 4-6 ms, mientras una ventana de 1080p con celda
+   de 14 px son **274x77 — 21 098 celdas, casi el doble** — y ahí el mismo frame cuesta 8-12 ms.
+   El pipeline escala con las celdas, así que una rejilla de bench chica no es una medida
+   optimista: es otra medida. `zoom-sweep.ts` usa 274x77 por defecto.
+   Con eso, el descenso completo sobre las tres ciudades va de **8.2 a 12.5 ms**, y lo que domina
+   son dos costes fijos por celda: `reduce` (2.5-4.8 ms) y `relief` (2.3-3.0 ms). No supongas que
+   estás dentro de presupuesto porque tu capa sea barata — **medí el stack completo**, con la
+   cámara en movimiento (una cámara quieta usa la caché de geometría y no mide nada).
 4. **Lo que cuesta un frame es la cantidad de puntos que se emiten, no el culling.** Instrumentado
    sobre la capa de calles: resolver la geometría son 0.1-0.7 ms y trazarla 2.5-5.8 ms. Antes de
    optimizar un recorrido, contá cuántos puntos llegan a `strokeLine` — y antes de guardar un
@@ -194,6 +197,11 @@ Medidos, no estimados. Tablas y método en `docs/ROADMAP.md`.
    aparte, y durante toda una fase no se midió: el panel decía 5 ms mientras `present` costaba
    mucho más haciendo un `fillText` por celda. Un contador que mide media tarea tranquiliza en vez
    de avisar. El panel del playground ahora muestra `pipeline + present`.
+7. **Y el consumo no es el coste del cuadro, es el coste por segundo.** Un frame de 10 ms a
+   sesenta por segundo tiene la CPU ocupada más de la mitad del tiempo y calienta un portátil en
+   cuanto arrastrás. El playground dibuja como mucho a 30 fps (`MIN_FRAME_MS`), que es la mitad de
+   trabajo y en un mapa de celdas de 7x14 px no se distingue. Antes de optimizar un milisegundo,
+   preguntá cuántas veces por segundo se paga.
 
 Dos patrones que ya se usan y conviene reusar antes de inventar otro:
 

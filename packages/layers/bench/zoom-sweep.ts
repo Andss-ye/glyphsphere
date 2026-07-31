@@ -45,8 +45,11 @@ const tiles = meta.tiles.map((t) =>
   decodeStreets(new Uint8Array(gunzipSync(readFileSync(`${A}${t.file}`))), meta, t),
 );
 
-const COLS = 200;
-const ROWS = 60;
+// Por defecto, la rejilla de una ventana de 1080p con celda de 14 px — que es la que ve el
+// usuario. Medir en una más chica fue exactamente el error que escondió el coste real: 200x60 son
+// la mitad de celdas que 274x77, y el pipeline escala con las celdas.
+const COLS = Number(process.env.COLS ?? 274);
+const ROWS = Number(process.env.ROWS ?? 77);
 const N = 12;
 const view = createViewMetrics(COLS, ROWS);
 const grid = new Grid(COLS, ROWS);

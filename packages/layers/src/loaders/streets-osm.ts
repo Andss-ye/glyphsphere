@@ -739,7 +739,15 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
   const tiles: StreetTile[] = [];
   const failures = new Map<string, { count: number; nextAttemptMs: number }>();
   const loaded = new Set<string>();
-  let inFlight = false;
+  /**
+   * Cuántas consultas se permiten a la vez.
+   *
+   * Dos, porque es lo que el propio Overpass anuncia (`Rate limit: 2` en su endpoint de estado):
+   * pedir de a una dejaba media ciudad sin dibujar durante un buen rato, y pasarse de ahí no trae
+   * nada antes — solo encola y consume la cuota.
+   */
+  const maxInFlight = 2;
+  const inFlight = new Set<string>();
   let status: OnlineStatus = 'idle';
 
   /** Suelta los tiles más lejanos cuando sobran, para que pasear no acumule sin fin. */
@@ -760,7 +768,7 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
     },
 
     request(lon, lat, altitudeKm, visibleWidthDeg = 0) {
-      if (inFlight || altitudeKm > maxAltitudeKm) return;
+      if (inFlight.size >= maxInFlight || altitudeKm > maxAltitudeKm) return;
       if (!isOnline()) {
         status = 'offline';
         return;
@@ -778,10 +786,16 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
       let pending = 0;
       let exhausted = 0;
       let here = 0;
+      let pidiendo = 0;
 
       for (const candidate of wanted) {
         if (loaded.has(candidate.id)) {
           here++;
+          continue;
+        }
+        // Ya se está pidiendo: ni se repite ni cuenta como pendiente de reintento.
+        if (inFlight.has(candidate.id)) {
+          pidiendo++;
           continue;
         }
         const failure = failures.get(candidate.id);
@@ -800,21 +814,29 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
       }
 
       if (!target) {
-        // Sin nada que pedir, lo que se informa es por qué: hay datos, se espera un reintento, o
-        // se dejó de insistir. Decir "listo" cuando no se pudo traer nada es la peor opción.
-        status = pending > 0 ? 'retrying' : exhausted > 0 && here === 0 ? 'unavailable' : 'idle';
+        // Sin nada nuevo que pedir, lo que se informa es por qué: sigue habiendo una consulta en
+        // curso, hay datos, se espera un reintento, o se dejó de insistir. Decir "listo" cuando
+        // no se pudo traer nada es la peor opción.
+        status =
+          pidiendo > 0
+            ? 'fetching'
+            : pending > 0
+              ? 'retrying'
+              : exhausted > 0 && here === 0
+                ? 'unavailable'
+                : 'idle';
         return;
       }
 
       const id = target.id;
-      inFlight = true;
+      inFlight.add(id);
       status = 'fetching';
 
       void fetchOnlineStreets(target.lon, target.lat, options)
         .then((result) => {
           // Antes de publicar el estado: si no, quien observe `status` verá que ya no se está
           // consultando mientras la siguiente petición todavía rebota contra el cerrojo.
-          inFlight = false;
+          inFlight.delete(id);
 
           if (result.status === 'ok') {
             loaded.add(id);
@@ -842,7 +864,7 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
           status = count >= BACKOFF_MS.length ? 'unavailable' : 'retrying';
         })
         .finally(() => {
-          inFlight = false;
+          inFlight.delete(id);
         });
     },
   };

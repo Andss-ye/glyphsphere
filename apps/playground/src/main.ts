@@ -528,8 +528,17 @@ function renderOnce(dtMs: number, timestampMs: number): void {
   const changed = lod.update(camera.state.altitudeKm);
   if (changed) void loadGeometryFor(changed);
 
-  // Las calles siguen a la cámara, no al LOD: dependen de *dónde* está, no solo de cuán bajo.
-  void loadStreetsFor(camera.state.lon, camera.state.lat, camera.state.altitudeKm);
+  /**
+   * Las calles siguen a la cámara, no al LOD: dependen de *dónde* está, no solo de cuán bajo.
+   *
+   * Cada dos décimas y no en cada cuadro: decidir qué cuadros hacen falta cuesta una proyección y
+   * una lista ordenada, y a sesenta por segundo es trabajo tirado — una descarga tarda segundos,
+   * así que preguntarlo cinco veces por segundo ya va sobrado.
+   */
+  if (timestampMs - lastStreetCheckMs >= STREET_CHECK_MS) {
+    lastStreetCheckMs = timestampMs;
+    void loadStreetsFor(camera.state.lon, camera.state.lat, camera.state.altitudeKm);
+  }
 
   // The light comes from the real solar position, so shading agrees with the terminator
   // and the same place looks different at different hours (docs/RELIEF.md).
@@ -597,14 +606,39 @@ function renderOnce(dtMs: number, timestampMs: number): void {
 
 const HUD_INTERVAL_MS = 125;
 let lastHudMs = -Infinity;
+const STREET_CHECK_MS = 200;
+let lastStreetCheckMs = -Infinity;
 
 /**
  * Runs only while something is moving. Once the camera settles the loop stops scheduling
  * frames, which is what "CPU tiende a cero con la cámara quieta" actually means — a static
  * globe must not keep the GPU and the fan awake.
  */
+/**
+ * Cadencia máxima mientras algo se mueve, en milisegundos entre cuadros.
+ *
+ * **Es la palanca que más baja el consumo, y con diferencia.** El cuadro completo cuesta unos
+ * 8-10 ms de pipeline más el pintado; a sesenta por segundo eso es la CPU ocupada de forma
+ * continua y un portátil que se calienta en cuanto arrastrás. A treinta es exactamente la mitad
+ * de trabajo, y un mapa de caracteres arrastrado a 30 fps se siente igual de fluido: el contenido
+ * son celdas de 7x14 px, no un juego que dependa de la latencia del cuadro.
+ *
+ * En reposo no cambia nada — el bucle ya se detiene solo, y sigue haciéndolo.
+ */
+const MIN_FRAME_MS = 1000 / 30;
+let lastRenderMs = -Infinity;
+
 function tick(timestamp: number): void {
   frameHandle = 0;
+
+  // Demasiado pronto: se vuelve a encolar sin dibujar, así que la entrada sigue atendiéndose y
+  // el trabajo pesado no se hace dos veces por cuadro de pantalla.
+  if (timestamp - lastRenderMs < MIN_FRAME_MS) {
+    requestFrame();
+    return;
+  }
+  lastRenderMs = timestamp;
+
   const dtMs = lastTimestamp ? Math.min(100, timestamp - lastTimestamp) : 16;
   lastTimestamp = timestamp;
 
