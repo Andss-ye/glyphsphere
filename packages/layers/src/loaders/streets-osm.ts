@@ -591,12 +591,17 @@ export async function fetchOnlineStreets(
 
   const mirrors = options.mirrors ?? DEFAULT_MIRRORS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const perMirrorMs = Math.min(timeoutMs, PER_MIRROR_TIMEOUT_MS);
+  /**
+   * El tope por espejo solo tiene sentido **si hay más de uno**: existe para que un espejo colgado
+   * no se coma el turno de los demás. Con uno solo no hay nadie a quien proteger, y recortarlo
+   * sería regalar presupuesto — que es justo el caso del proxy del mismo origen, donde la única
+   * espera legítima es la de la consulta.
+   */
+  const perMirrorMs =
+    mirrors.length === 1 ? timeoutMs : Math.min(timeoutMs, PER_MIRROR_TIMEOUT_MS);
   // El servidor recibe el mismo plazo que espera el cliente para *esa* consulta: colgar antes no
   // libera su turno, y pedirle más de lo que se va a esperar lo pone a trabajar para nadie.
-  const body = new URLSearchParams({
-    data: overpassQuery(bbox, Math.floor(perMirrorMs / 1000)),
-  });
+  const query = overpassQuery(bbox, Math.floor(perMirrorMs / 1000));
 
   /**
    * Un sondeo barato antes de gastar el plazo largo contra un servidor que no está — y si el
@@ -628,10 +633,17 @@ export async function fetchOnlineStreets(
   for (const mirror of mirrorsByHealth(mirrors)) {
     if (deadline.aborted) break;
     try {
-      const response = await fetch(mirror, {
-        method: 'POST',
+      /**
+       * GET con la consulta en la URL, no POST.
+       *
+       * Overpass acepta las dos (verificado contra dos espejos), y GET tiene dos ventajas que
+       * importan acá: una respuesta con URL propia la puede guardar la caché del navegador y la
+       * de un CDN — volver a la misma zona, o recargar la página, deja de costar diez segundos —
+       * y no hay cuerpo que un proxy pueda interpretar distinto según el host. La consulta son
+       * unos 500 caracteres, muy por debajo de cualquier límite de URL.
+       */
+      const response = await fetch(`${mirror}?data=${encodeURIComponent(query)}`, {
         headers: REQUEST_HEADERS,
-        body,
         // El plazo compartido **y** el de este espejo: el que salte primero corta. Sin el
         // segundo, un espejo colgado se lleva el presupuesto entero y el siguiente no llega a
         // preguntarse nada.

@@ -1,0 +1,4 @@
+# Vercel convierte en función *cada* archivo de `api/`, y el test de al lado no es un endpoint:
+# importa vitest, que es una dependencia de desarrollo, así que desplegarlo rompe el build. Vive
+# junto al proxy a propósito — es donde se lee — y se queda fuera del despliegue desde acá.
+api/**/*.test.ts

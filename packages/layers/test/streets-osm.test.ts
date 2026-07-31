@@ -214,6 +214,17 @@ const UNO = 'https://uno.invalid/api/interpreter';
 const DOS = 'https://dos.invalid/api/interpreter';
 
 /**
+ * La consulta viaja en la URL, no en el cuerpo: se pide con GET para que la respuesta tenga URL
+ * propia y la puedan guardar tanto el navegador como un CDN. Así que identificar un espejo es
+ * mirar el prefijo, no comparar la URL entera.
+ */
+const esEspejo = (url: unknown, mirror: string): boolean => String(url).startsWith(`${mirror}?`);
+
+/** Lo que se pidió, leído de la URL. */
+const consultaDe = (url: unknown): string =>
+  new URL(String(url), 'http://base.invalid').searchParams.get('data') ?? '';
+
+/**
  * Lo que hay que poder afirmar del modo en línea es **negativo**: que nunca sea la razón de que
  * el mapa deje de funcionar. Es un extra sobre lo horneado, así que ningún fallo lanza — todos
  * salen como un estado y dejan al mapa dibujando lo que ya tiene.
@@ -278,7 +289,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
 
   it('un espejo que revienta no impide que el siguiente conteste', async () => {
     globalThis.fetch = fetchFalso((url) =>
-      url === UNO
+      esEspejo(url, UNO)
         ? { ok: true, json: async () => ({ elements: [], remark: 'runtime error: out of memory' }) }
         : respondeCon([CALLE()]),
     ) as unknown as typeof fetch;
@@ -299,23 +310,55 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
      * El plazo que cuenta es el **del espejo**, no el de la búsqueda entera: es lo que esa
      * consulta va a esperar de verdad antes de que se corte.
      */
+    const fetchSpy = fetchFalso(() => respondeCon([CALLE()]));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const consultas = (): string[] =>
+      fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status')).map(([u]) => consultaDe(u));
+
+    // Con varios espejos manda el tope por espejo: nadie puede quedarse el presupuesto entero.
+    await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+      timeoutMs: 45_000,
+    });
+    expect(consultas()[0]).toContain('[timeout:12]');
+
+    // Y un presupuesto más corto que el tope manda igual: nunca se pide más de lo que se espera.
+    fetchSpy.mockClear();
+    await fetchOnlineStreets(-74.2, 4.9, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+      timeoutMs: 5_000,
+    });
+    expect(consultas()[0]).toContain('[timeout:5]');
+  });
+
+  it('con un solo espejo, el presupuesto entero es suyo', async () => {
+    /**
+     * El tope por espejo existe para que uno colgado no deje sin turno a los demás. Con uno solo
+     * no hay a quién proteger, y recortarlo sería regalar presupuesto — que es exactamente el caso
+     * del proxy del mismo origen, donde la única espera legítima es la de la consulta.
+     */
     const fetchSpy = vi.fn().mockResolvedValue(respondeCon([CALLE()]));
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
-    await fetchOnlineStreets(-74.07, 4.65, { ...options, timeoutMs: 45_000 });
-    const body = fetchSpy.mock.calls[0]![1]!.body as URLSearchParams;
-    expect(body.get('data')).toContain('[timeout:12]');
+    await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: ['/api/overpass'],
+      timeoutMs: 25_000,
+    });
 
-    // Y un presupuesto más corto que el tope por espejo manda: nunca se pide más de lo que se espera.
-    fetchSpy.mockClear();
-    await fetchOnlineStreets(-74.2, 4.9, { ...options, timeoutMs: 5_000 });
-    expect((fetchSpy.mock.calls[0]![1]!.body as URLSearchParams).get('data'))
-      .toContain('[timeout:5]');
+    const [url] = fetchSpy.mock.calls[0]!;
+    expect(consultaDe(url)).toContain('[timeout:25]');
+    // Y con un espejo solo no hay nada que sondear: una petición, la consulta.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(url).startsWith('/api/overpass?')).toBe(true);
   });
 
   it('prueba el siguiente espejo cuando el primero falla', async () => {
     const fetchSpy = fetchFalso((url) => {
-      if (url === UNO) throw new Error('timeout');
+      if (esEspejo(url, UNO)) throw new Error('timeout');
       return respondeCon([CALLE()]);
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -336,7 +379,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
      * durante minutos.
      */
     const fetchSpy = fetchFalso((url) => {
-      if (url === UNO) throw new Error('ECONNREFUSED');
+      if (esEspejo(url, UNO)) throw new Error('ECONNREFUSED');
       return respondeCon([CALLE()]);
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -348,7 +391,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     }
 
     // El caído se prueba una vez y queda apartado; las tres consultas siguientes no lo tocan.
-    expect(fetchSpy.mock.calls.filter(([url]) => url === UNO)).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([url]) => esEspejo(url, UNO))).toHaveLength(1);
   });
 
   it('si todos los espejos están apartados, lo intenta igual', async () => {
@@ -385,7 +428,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     const fetchSpy = vi.fn().mockImplementation((url: string) => {
       const estado = sinEstado(url);
       if (estado) return estado;
-      if (url === colgado) return Promise.reject(new Error('TimeoutError'));
+      if (esEspejo(url, colgado)) return Promise.reject(new Error('TimeoutError'));
       return Promise.resolve({ ok: false, status: 504 });
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -398,7 +441,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     fetchSpy.mockImplementation((url: string) => {
       const estado = sinEstado(url);
       if (estado) return estado;
-      return url === colgado
+      return esEspejo(url, colgado)
         ? Promise.reject(new Error('TimeoutError'))
         : Promise.resolve(respondeCon([CALLE()]));
     });
@@ -407,7 +450,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     expect(result.status).toBe('ok');
     // El que menos castigo tenía va primero: se resuelve sin pagar el plazo del colgado.
     const consultas = fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'));
-    expect(consultas[0]![0]).toBe(ocupado);
+    expect(esEspejo(consultas[0]![0], ocupado)).toBe(true);
   });
 
   it('sondea el estado antes de gastar el plazo contra un espejo que no está', async () => {
@@ -657,8 +700,8 @@ describe('la política de cortesía del origen en línea', () => {
    * cuadros vecinos, el codificador la recorta, y el resultado es "aquí no hay calles" — que es
    * una respuesta legítima y hace pasar el test por el motivo equivocado.
    */
-  function calleEnLaCaja(init: RequestInit | undefined): OverpassWay[] {
-    const data = (init?.body as URLSearchParams | undefined)?.get('data') ?? '';
+  function calleEnLaCaja(url: unknown): OverpassWay[] {
+    const data = consultaDe(url);
     const m = /\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)/.exec(data);
     if (!m) return [];
     const [minLat, minLon, maxLat, maxLon] = m.slice(1).map(Number) as [
@@ -685,11 +728,11 @@ describe('la política de cortesía del origen en línea', () => {
      * ancho de la pantalla a 25 km de altitud. El tile llegaba bien y no se veía nada: un parche
      * diminuto en mitad de una vista mucho más ancha.
      */
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
 
     const source = createOnlineStreetSource(nunca);
@@ -715,11 +758,11 @@ describe('la política de cortesía del origen en línea', () => {
   });
 
   it('no acumula ciudades sin fin al pasear por el mundo', async () => {
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
     const source = createOnlineStreetSource(nunca);
 
@@ -737,12 +780,12 @@ describe('la política de cortesía del origen en línea', () => {
      * aunque quien llama pida menos.
      */
     let consultas = 0;
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
       consultas++;
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
 
     const source = createOnlineStreetSource({ ...nunca, maxTiles: 2 });

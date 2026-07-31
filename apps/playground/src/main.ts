@@ -232,9 +232,28 @@ function streetUrlFor(file: string): string | undefined {
  * Toda la cortesía con Overpass (una consulta en vuelo, espera creciente, rendición) vive en el
  * origen, no acá: esto se llama una vez por frame y tiene que ser barato y no repetir.
  */
+/**
+ * Se consulta **el proxy del mismo origen**, no los espejos públicos.
+ *
+ * Desde una conexión doméstica normal, dos de los tres espejos son inalcanzables —
+ * `overpass-api.de` rechaza la conexión y `overpass.private.coffee` no contesta nunca — y como el
+ * cliente los prueba en cadena, el presupuesto se agotaba antes de llegar al que sirve. En la
+ * consola eran dos `ERR_CONNECTION_REFUSED` sin código de estado y un mapa sin calles.
+ *
+ * Con el proxy el navegador hace una sola petición, a su propio origen: sin CORS, sin preflight,
+ * y con la elección de espejo pagada una vez en el servidor. Ver `api/overpass.ts`.
+ *
+ * Un espejo solo, así que el plazo entero es suyo: no hay nadie a quien proteger de él.
+ */
+const OVERPASS_PROXY = '/api/overpass';
+
 const onlineStreets = createOnlineStreetSource({
   radiusKm: earth.radiusKm,
   maxAltitudeKm: STREETS_ALTITUDE_KM,
+  mirrors: [OVERPASS_PROXY],
+  // Lo que tarda un cuadro urbano denso contra un espejo sano, medido: unos diez segundos. El
+  // resto es margen para el arranque en frío de la función, que corre los tres espejos a la vez.
+  timeoutMs: 25_000,
   onTile: (tile) => {
     streets.push(tile);
     rebuildStack();

@@ -3,5 +3,10 @@
   "framework": null,
   "installCommand": "pnpm install",
   "buildCommand": "pnpm data:build && pnpm --filter @glyphsphere/playground build",
-  "outputDirectory": "apps/playground/dist"
+  "outputDirectory": "apps/playground/dist",
+  "functions": {
+    "api/overpass.ts": {
+      "maxDuration": 30
+    }
+  }
 }
