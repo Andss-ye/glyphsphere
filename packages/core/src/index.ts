@@ -1,4 +1,8 @@
 export { Grid, type CellData } from './grid/grid.js';
+// El layout de celda lo necesita cualquier backend que quiera leer `grid.cells` sin pagar un
+// objeto por celda — que es lo que separa un render de 20 000 asignaciones por cuadro de uno de
+// cero (ver `renderer-canvas`).
+export { BYTES_PER_CELL, CELL_OFFSET } from './grid/layout.js';
 
 export { PALETTE, PAL, paletteColor, type Palette } from './palette/palette.js';
 
@@ -68,9 +72,11 @@ export {
 
 export {
   CELL_ASPECT,
+  FOV_DEG,
   type ViewMetrics,
   createViewMetrics,
-  discRadiusRows,
+  viewportHalfRows,
+  groundAngleRad,
 } from './projection/aspect.js';
 export type { Projection, SubcellProjection } from './projection/projection.js';
 export { buildProjection } from './projection/satellite.js';

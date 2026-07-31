@@ -41,7 +41,7 @@ export function landmaskLayer(options: LandmaskOptions): Layer {
       // to the detail the view can actually resolve. At a low altitude this is the difference
       // between streaming 400 000 points and streaming a few thousand; at globe view it rejects
       // nothing and costs one dot product per cap.
-      const view = viewCap(ctx.camera.lon, ctx.camera.lat, Math.acos(1 / ctx.projection.distance));
+      const view = viewCap(ctx.camera.lon, ctx.camera.lat, ctx.projection.visibleGroundRad());
 
       // One subcell, as an angle on the body: the finest detail this frame can represent.
       const subcellRad =

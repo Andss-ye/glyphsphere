@@ -21,6 +21,6 @@
     "@types/topojson-specification": "^1.0.5"
   },
   "scripts": {
-    "bench": "tsx bench/profile-l4.ts"
+    "bench": "tsx bench/profile-l4.ts && tsx bench/streets.ts"
   }
 }

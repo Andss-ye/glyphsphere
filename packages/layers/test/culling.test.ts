@@ -9,6 +9,7 @@ import {
   boundingCap,
   capIsVisible,
   capRuns,
+  resolveLine,
   resolveRing,
   viewCap,
   parseLandTopology,
@@ -174,5 +175,110 @@ describe('against the real coastline', () => {
     const outline = visibleLines(land.outlineSegments, view, 0);
     // Florida's coast is in view: something has to be there.
     expect(outline.coordinates.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * `resolveLine` is the stroke counterpart of `resolveRing`, and it is allowed to do something
+ * `resolveRing` must never do: **drop** geometry rather than thin it. A line has no interior, so
+ * a stretch that is off screen contributes nothing — but dropping it has to split the polyline,
+ * because joining across the gap draws a chord, and where a coastline leaves the view and comes
+ * back that chord lands right across the screen.
+ */
+describe('resolveLine', () => {
+  /** Every point of every emitted segment, and the segments themselves. */
+  function run(ring: Position[], view: ReturnType<typeof viewCap>, subcellRad = 0) {
+    const segments: Position[][] = [];
+    const pool: Position[][] = [];
+    let taken = 0;
+    resolveLine(
+      capRuns(ring),
+      view,
+      subcellRad,
+      () => {
+        const array = pool[taken] ?? [];
+        pool[taken] = array;
+        taken++;
+        return array;
+      },
+      (segment) => segments.push(segment),
+    );
+    return segments;
+  }
+
+  /** A line of `count` points marching east along the equator from `fromLon`. */
+  function equatorLine(fromLon: number, toLon: number, count: number): Position[] {
+    return Array.from({ length: count }, (_, i) => [
+      fromLon + ((toLon - fromLon) * i) / (count - 1),
+      0,
+    ]);
+  }
+
+  it('invents no points: every coordinate comes from the source', () => {
+    const line = equatorLine(-40, 40, 600);
+    const source = new Set(line.map((p) => `${p[0]},${p[1]}`));
+    for (const segment of run(line, viewCap(0, 0, 0.1))) {
+      for (const point of segment) {
+        expect(source.has(`${point[0]},${point[1]}`)).toBe(true);
+      }
+    }
+  });
+
+  it('drops the far stretches instead of thinning them', () => {
+    // A line crossing a third of the planet, seen through a narrow view at its middle.
+    const line = equatorLine(-60, 60, 1200);
+    const kept = run(line, viewCap(0, 0, 0.05)).flat();
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(line.length / 4);
+
+    // And what survives is actually near the view, not a scattering of the whole line.
+    for (const point of kept) {
+      expect(Math.abs(point[0]!)).toBeLessThan(30);
+    }
+  });
+
+  it('never joins across a gap: no segment contains a chord across the view', () => {
+    // Two separate stretches near the view with a long excursion between them, which is the
+    // shape that produces a false coastline if the dropped runs are silently skipped.
+    const line: Position[] = [
+      ...equatorLine(-8, -2, 200),
+      ...equatorLine(-2, 178, 400).slice(1),
+      ...equatorLine(178, 182, 200).slice(1),
+    ];
+    const view = viewCap(0, 0, 0.05);
+
+    for (const segment of run(line, view)) {
+      for (let i = 1; i < segment.length; i++) {
+        const step = geoDistance(
+          [segment[i - 1]![0]!, segment[i - 1]![1]!],
+          [segment[i]![0]!, segment[i]![1]!],
+        );
+        // Consecutive points inside a segment stay adjacent on the source line; a joined gap
+        // would show up here as a single stride of tens of degrees.
+        expect(step).toBeLessThan(0.5);
+      }
+    }
+  });
+
+  it('emits nothing for a line that never reaches the view', () => {
+    const line = equatorLine(100, 160, 400);
+    expect(run(line, viewCap(-70, 0, 0.05))).toEqual([]);
+  });
+
+  it('keeps a line that sits entirely inside the view in one piece', () => {
+    const line = equatorLine(-1, 1, 300);
+    const segments = run(line, viewCap(0, 0, 0.6));
+    expect(segments.length).toBe(1);
+    expect(segments[0]!.length).toBeGreaterThan(line.length / 2);
+  });
+
+  it('reaches past the viewport edge, so a stroke does not stop short of it', () => {
+    // Runs just outside the view are still emitted: a coastline has to arrive from beyond the
+    // border, or every stroke would end in mid-air at the edge of the frame.
+    const line = equatorLine(-20, 20, 800);
+    const radius = 0.05;
+    const kept = run(line, viewCap(0, 0, radius)).flat();
+    const reach = Math.max(...kept.map((p) => Math.abs(p[0]!)));
+    expect(reach).toBeGreaterThan((radius * 180) / Math.PI);
   });
 });

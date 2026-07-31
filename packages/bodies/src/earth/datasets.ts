@@ -26,4 +26,12 @@ export const EARTH_DATASETS: DatasetManifest = {
     L3: 'countries-50m',
     L4: 'countries-10m',
   },
+  // Escala urbana. Un solo dataset para L4-L7: Natural Earth 10m es la resolución más fina que
+  // hay offline, así que no hay una escalera que subir por debajo de eso.
+  urban: {
+    L4: 'roads-urban-10m',
+    L5: 'roads-urban-10m',
+    L6: 'roads-urban-10m',
+    L7: 'roads-urban-10m',
+  },
 };

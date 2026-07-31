@@ -2,9 +2,9 @@ import { geoDistance } from 'd3-geo';
 import { geoSatellite } from 'd3-geo-projection';
 import type { Body } from '../body.js';
 import type { CameraState } from '../camera/state.js';
-import { discRadiusRows, type ViewMetrics } from './aspect.js';
+import { groundAngleRad, viewportHalfRows, type ViewMetrics } from './aspect.js';
 import type { Projection, SubcellProjection } from './projection.js';
-import { cameraDistance, horizonAngleRad, isVisible } from './visibility.js';
+import { cameraDistance, isVisible } from './visibility.js';
 
 const DEG_PER_RAD = 180 / Math.PI;
 
@@ -25,19 +25,41 @@ const CLIP_EPSILON_DEG = 1e-6;
 export function buildProjection(body: Body, cam: CameraState, view: ViewMetrics): Projection {
   const P = cameraDistance(body, cam.altitudeKm);
   const clipAngleDeg = Math.acos(1 / P) * DEG_PER_RAD - CLIP_EPSILON_DEG;
-  const radiusRows = discRadiusRows(view);
+  const halfRows = viewportHalfRows(view);
 
-  // docs/CAMERA.md §3 derives rho(c) = sin(c)/(P - cos(c)) and rho(c_horizon) = 1/sqrt(P^2-1),
-  // giving scale = radiusRows * sqrt(P^2-1). That derivation is right, but d3's satelliteRaw
-  // does not implement raw rho: it returns k = (P-1)/(P - cos(c)), i.e. (P-1) * rho(c). So the
-  // scale handed to d3 has to divide that normalization back out:
+  // rho(c) = sin(c)/(P - cos(c)) is the projection's radial term, and rho(c_horizon) =
+  // 1/sqrt(P^2-1). d3's satelliteRaw does not implement raw rho: it returns
+  // k = (P-1)/(P - cos(c)), i.e. (P-1) * rho(c). So a scale that puts rho_max at the viewport
+  // edge has to divide that normalization back out:
   //
-  //   r_limb = scale * (P-1) * rho(c_h) = scale * (P-1)/sqrt(P^2-1)  =!=  radiusRows
-  //   => scale = radiusRows * sqrt(P^2-1)/(P-1) = radiusRows * sqrt((P+1)/(P-1))
+  //   r_edge = scale * (P-1) * rho_max  =!=  halfRows
+  //   => scale = halfRows / ((P-1) * rho_max)
   //
-  // Sanity check on the limit the doc states: as P -> infinity this tends to radiusRows, and
-  // d3's k tends to 1, so the projection becomes orthographic of scale radiusRows. Consistent.
-  const scale = radiusRows * Math.sqrt((P + 1) / (P - 1));
+  // **What rho_max is, is the framing decision.** rho(c) = tan(alpha), the angle off the optical
+  // axis (see groundAngleRad), so choosing rho_max is choosing a lens:
+  //
+  //   rho_max = rho(c_horizon)  -> the horizon always touches the viewport edge. Correct from
+  //             orbit, and the reason zoom used to stall: as altitude falls, c_horizon closes in
+  //             at grazing incidence and this implies an ever-wider lens, tending to 180 deg.
+  //   rho_max = tan(fov/2)      -> a fixed lens. Ground scale then tracks altitude all the way
+  //             down, which is what "zoom continuo hasta nivel de calle" requires.
+  //
+  // Taking the smaller of the two gives both: the body fits the frame whenever it is small
+  // enough to, and the lens takes over once it overflows. min() is continuous, so there is no
+  // jump at the crossover (P = 1/sin(fov/2)).
+  //
+  // Sanity check on the orbital limit: as P -> infinity, rho(c_h) -> 0 so it wins the min, and
+  // scale -> halfRows * sqrt((P+1)/(P-1)) -> halfRows while d3's k -> 1. Orthographic of scale
+  // halfRows, exactly as before this parameter existed.
+  const rhoHorizon = 1 / Math.sqrt(P * P - 1);
+  const rhoMax = Math.min(rhoHorizon, Math.tan((view.fovDeg / 2) / DEG_PER_RAD));
+  const scale = halfRows / ((P - 1) * rhoMax);
+
+  // Where the limb actually lands, which is no longer the viewport edge: once the lens is
+  // narrower than the horizon this exceeds halfRows, i.e. the horizon is off screen. `fromCell`
+  // uses it to reject coordinates with no surface under them, and `buildChrome` to decide the
+  // limb ring is not worth drawing.
+  const radiusRows = halfRows * (rhoHorizon / rhoMax);
 
   // d3 rotates the world under the camera, not the camera over the world — hence the negated
   // signs. This is the number-one source of confusion with d3-geo.
@@ -92,10 +114,24 @@ export function buildProjection(body: Body, cam: CameraState, view: ViewMetrics)
       return isVisible(lonLat, cam, body, targetAltKm);
     },
 
+    visibleGroundRad() {
+      // To the viewport corner, so nothing drawn is ever outside the radius. `rho` scales
+      // linearly with screen radius, so the corner's rho follows from the edge's by ratio.
+      const halfDiagonalRows = Math.hypot((view.cols * cellAspect) / 2, view.rows / 2);
+      const rhoCorner = (halfDiagonalRows * rhoMax) / halfRows;
+      // atan(rhoHorizon) is the horizon ray, and groundAngleRad saturates there, so the min is
+      // what keeps this from claiming ground beyond the limb.
+      return groundAngleRad(P, Math.atan(Math.min(rhoCorner, rhoHorizon)));
+    },
+
     metersPerCell() {
-      const visibleArcKm = horizonAngleRad(body, cam.altitudeKm) * body.radiusKm;
-      const radiusCells = Math.min(view.cols * cellAspect, view.rows) / 2;
-      return (visibleArcKm * 1000) / radiusCells;
+      // Ground covered between the view centre and the viewport edge, over the rows it spans.
+      // Derived from rho_max rather than from the horizon: with a lens narrower than the horizon
+      // those are different numbers, and every caller means "how much ground is one cell" —
+      // layers size their thinning by it, so reading the horizon here would leave them thinning
+      // for a view hundreds of times wider than the one on screen.
+      const arcKm = groundAngleRad(P, Math.atan(rhoMax)) * body.radiusKm;
+      return (arcKm * 1000) / halfRows;
     },
 
     subcellProjection(subX, subY): SubcellProjection {

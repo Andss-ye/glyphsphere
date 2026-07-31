@@ -1,5 +1,7 @@
 import {
   BLANK_CODEPOINTS,
+  BYTES_PER_CELL,
+  CELL_OFFSET,
   buildAtlas,
   Grid,
   NO_CHROME,
@@ -10,6 +12,7 @@ import {
   type GlyphAtlas,
 } from '@glyphsphere/core';
 import { createCanvasGlyphSampler } from './glyph-sampler.js';
+import { TintedSheets } from './tinted-sheets.js';
 
 export interface CellMetrics {
   readonly width: number;
@@ -39,14 +42,33 @@ export class CanvasRenderer {
   private cellPx: CellMetrics;
   readonly atlas: GlyphAtlas;
 
+  /** La rejilla, conservada entre cuadros. Ver `present`. */
+  private readonly gridCanvas: HTMLCanvasElement;
+  private gridCtx: CanvasRenderingContext2D;
+  private sheets: TintedSheets;
+  /** La rejilla del cuadro anterior, una palabra por celda. Ver `present`. */
+  private previous = new Uint32Array(0);
+  private everythingDirty = true;
+
   constructor(private readonly canvas: HTMLCanvasElement, options: CanvasRendererOptions = {}) {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('CanvasRenderer requires a 2D context');
     this.ctx = ctx;
     this.font = options.font ?? DEFAULT_FONT_STACK;
 
+    this.gridCanvas = document.createElement('canvas');
+    const gridCtx = this.gridCanvas.getContext('2d');
+    if (!gridCtx) throw new Error('CanvasRenderer requires a 2D context');
+    this.gridCtx = gridCtx;
+
     const cellHeightPx = options.cellHeightPx ?? 14;
     this.cellPx = { width: cellHeightPx * DEFAULT_CELL_ASPECT, height: cellHeightPx };
+    this.sheets = new TintedSheets(
+      this.font,
+      this.cellPx.width,
+      this.cellPx.height,
+      window.devicePixelRatio || 1,
+    );
 
     // One atlas per (charset, font, size, dpr), per docs/RENDERING.md. Built once here; a
     // future LayerStack/resize hook can rebuild it if font or size change.
@@ -69,49 +91,151 @@ export class CanvasRenderer {
   }
 
   resize(cols: number, rows: number, cell: CellMetrics = this.cellPx): void {
+    const changedCell = cell.width !== this.cellPx.width || cell.height !== this.cellPx.height;
     this.cellPx = cell;
 
     const dpr = window.devicePixelRatio || 1;
-    this.canvas.width = Math.round(cols * cell.width * dpr);
-    this.canvas.height = Math.round(rows * cell.height * dpr);
+    const widthPx = Math.round(cols * cell.width * dpr);
+    const heightPx = Math.round(rows * cell.height * dpr);
+
+    this.canvas.width = widthPx;
+    this.canvas.height = heightPx;
     this.canvas.style.width = `${cols * cell.width}px`;
     this.canvas.style.height = `${rows * cell.height}px`;
 
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    this.ctx.font = `${cell.height}px ${this.font}`;
-    this.ctx.textBaseline = 'top';
+    // Asignar el tamaño borra el lienzo, así que el próximo cuadro tiene que pintarlo entero.
+    this.gridCanvas.width = widthPx;
+    this.gridCanvas.height = heightPx;
+
+    for (const context of [this.ctx, this.gridCtx]) {
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.font = `${cell.height}px ${this.font}`;
+      context.textBaseline = 'top';
+    }
+
+    // Las hojas se rasterizan al tamaño de celda: si cambió, las de antes ya no sirven.
+    if (changedCell) this.sheets = new TintedSheets(this.font, cell.width, cell.height, dpr);
+    this.everythingDirty = true;
   }
 
   /**
-   * ponytail: one fillText per non-blank cell, no pre-tinted atlas. Correct and simple; swap
-   * in the 16-canvas tinted-atlas trick from docs/RENDERING.md if profiling shows this is over
-   * budget on a real grid size.
+   * Pinta la rejilla.
+   *
+   * Dos cosas la hacen barata, y las dos hacen falta:
+   *
+   * - **Los glifos se copian, no se componen.** Cada carácter sale de una hoja ya rasterizada en
+   *   su color (`TintedSheets`), así que la celda cuesta un `drawImage` y no un `fillText`.
+   * - **Solo se repinta lo que cambió.** La rejilla vive en un lienzo aparte que se conserva
+   *   entre cuadros; se compara celda a celda contra el cuadro anterior y se tocan únicamente
+   *   las distintas. Al arrastrar cambia casi todo y la ganancia la da el punto anterior; al
+   *   quedarse quieto no cambia nada y el cuadro cuesta una copia.
+   *
+   * El lienzo aparte además es lo que permite lo segundo: el limbo es un trazo vectorial encima,
+   * y si se dibujara sobre la propia rejilla habría que borrarlo entero cada cuadro — que es
+   * exactamente ensuciar todas las celdas.
    */
   present(grid: Grid, chrome: ChromeCommands = NO_CHROME): void {
-    const { ctx, cellPx } = this;
-    ctx.fillStyle = paletteColor(PALETTE, PAL.VOID);
-    ctx.fillRect(0, 0, grid.cols * cellPx.width, grid.rows * cellPx.height);
+    const { cellPx } = this;
+    const gridCtx = this.gridCtx;
+    const cells = grid.cells;
+    const cellCount = grid.cols * grid.rows;
 
-    let lastFg = -1;
-    for (let y = 0; y < grid.rows; y++) {
-      for (let x = 0; x < grid.cols; x++) {
-        const cell = grid.get(x, y);
-        if (cell.glyph === 0 || BLANK_CODEPOINTS.has(cell.glyph)) continue;
+    // Un cambio de tamaño invalida el lienzo entero: se repinta todo una vez.
+    if (this.previous.length !== cellCount) {
+      this.previous = new Uint32Array(cellCount);
+      this.everythingDirty = true;
+    }
 
-        if (cell.bg !== PAL.VOID) {
-          ctx.fillStyle = paletteColor(PALETTE, cell.bg);
-          ctx.fillRect(x * cellPx.width, y * cellPx.height, cellPx.width, cellPx.height);
-          lastFg = -1; // fillStyle was just overwritten for the background rect
-        }
-        if (cell.fg !== lastFg) {
-          ctx.fillStyle = paletteColor(PALETTE, cell.fg);
-          lastFg = cell.fg;
-        }
-        ctx.fillText(String.fromCodePoint(cell.glyph), x * cellPx.width, y * cellPx.height);
+    /**
+     * La comparación va de palabra en palabra, no de byte en byte.
+     *
+     * Una celda son exactamente cuatro bytes, así que verla como un `uint32` compara las cuatro
+     * de una vez: en una rejilla de 274x77 son 21 000 comparaciones en lugar de 84 000. Los bytes
+     * solo se leen para las celdas que de verdad cambiaron.
+     */
+    const current = new Uint32Array(cells.buffer, cells.byteOffset, cellCount);
+    const previous = this.previous;
+
+    /**
+     * Cuántas celdas cambiaron, antes de dibujar ninguna.
+     *
+     * Sirve para elegir estrategia. Repintar el fondo celda a celda cuesta un `fillRect` por
+     * celda **además** del glifo — dos operaciones donde puede haber una. Cuando cambia casi todo,
+     * que es exactamente lo que pasa al arrastrar, sale mucho más barato borrar el lienzo entero
+     * de una vez y dibujar solo los glifos.
+     */
+    let dirty = 0;
+    if (this.everythingDirty) {
+      dirty = cellCount;
+    } else {
+      for (let i = 0; i < cellCount; i++) if (current[i] !== previous[i]) dirty++;
+      if (dirty === 0) {
+        // Nada que repintar: solo la copia a pantalla y el limbo, que sigue a la cámara.
+        this.ctx.drawImage(
+          this.gridCanvas,
+          0,
+          0,
+          grid.cols * cellPx.width,
+          grid.rows * cellPx.height,
+        );
+        this.drawChrome(chrome);
+        return;
       }
     }
 
+    const voidColour = paletteColor(PALETTE, PAL.VOID);
+    const wipe = dirty * 2 >= cellCount;
+    if (wipe) {
+      gridCtx.fillStyle = voidColour;
+      gridCtx.fillRect(0, 0, grid.cols * cellPx.width, grid.rows * cellPx.height);
+    }
+
+    const all = this.everythingDirty || wipe;
+
+    for (let y = 0, index = 0, i = 0; y < grid.rows; y++) {
+      for (let x = 0; x < grid.cols; x++, index++, i += BYTES_PER_CELL) {
+        const word = current[index]!;
+        if (!all && word === previous[index]!) continue;
+        previous[index] = word;
+
+        const bg = cells[i + CELL_OFFSET.BG]!;
+        const lo = cells[i + CELL_OFFSET.GLYPH_LO]!;
+        const glyph = lo | (cells[i + CELL_OFFSET.GLYPH_HI]! << 8);
+        const blank = glyph === 0 || glyph === 32 || BLANK_CODEPOINTS.has(glyph);
+
+        // Con el lienzo recién borrado, una celda de fondo vacío ya está como tiene que estar.
+        if (blank && bg === PAL.VOID && wipe) continue;
+
+        const px = x * cellPx.width;
+        const py = y * cellPx.height;
+
+        if (!wipe || bg !== PAL.VOID) {
+          // Fuera del borrado, una celda que cambió se repinta desde cero: debajo puede haber
+          // quedado el glifo del cuadro anterior.
+          gridCtx.fillStyle = bg === PAL.VOID ? voidColour : paletteColor(PALETTE, bg);
+          gridCtx.fillRect(px, py, cellPx.width, cellPx.height);
+        }
+
+        if (blank) continue;
+        this.sheets.draw(gridCtx, glyph, cells[i + CELL_OFFSET.FG]!, px, py);
+      }
+    }
+
+    this.everythingDirty = false;
+
+    this.ctx.drawImage(
+      this.gridCanvas,
+      0,
+      0,
+      grid.cols * cellPx.width,
+      grid.rows * cellPx.height,
+    );
     this.drawChrome(chrome);
+  }
+
+  /** Fuerza el repintado completo del próximo cuadro. Para un cambio de fuente o de paleta. */
+  invalidate(): void {
+    this.everythingDirty = true;
   }
 
   /**

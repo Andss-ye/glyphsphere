@@ -37,7 +37,7 @@ export function bordersLayer(options: BordersOptions): Layer {
     visibleAt: (camera) => camera.altitudeKm <= maxAltitudeKm,
 
     paint(ctx) {
-      const view = viewCap(ctx.camera.lon, ctx.camera.lat, Math.acos(1 / ctx.projection.distance));
+      const view = viewCap(ctx.camera.lon, ctx.camera.lat, ctx.projection.visibleGroundRad());
       const subcellRad = ctx.projection.metersPerCell() / SUB_X / (ctx.body.radiusKm * 1000);
 
       visible.coordinates.length = 0;

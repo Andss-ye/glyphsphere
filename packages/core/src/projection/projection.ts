@@ -32,8 +32,19 @@ export interface Projection {
   readonly distance: number;
   /** Angular radius of the visible cap, in degrees. */
   readonly clipAngleDeg: number;
-  /** Disc radius in row units. */
+  /** Where the limb lands, in row units. Exceeds the viewport once the lens is the narrower. */
   readonly radiusRows: number;
+
+  /**
+   * Angular radius of the ground the viewport can actually show, in radians — measured to the
+   * corner, so nothing on screen is ever outside it, and capped at the horizon.
+   *
+   * **This is what layers must cull against**, not the horizon. The two used to be near enough
+   * to the same thing that the difference did not matter; with a field of view they diverge by
+   * orders of magnitude, and culling to the horizon means streaming a continent's worth of
+   * coordinates to draw a neighbourhood.
+   */
+  visibleGroundRad(): number;
 
   /** lonLat -> cell coordinates. null when the point is clipped (hidden hemisphere). */
   toCell(lonLat: readonly [number, number]): [number, number] | null;

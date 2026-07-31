@@ -95,6 +95,9 @@ export const DEFAULT_REDUCE_OPTIONS: ReduceOptions = {
     [LINE_CLASS.BORDER]: PAL.CHROME,
     [LINE_CLASS.ROAD]: PAL.CHROME,
     [LINE_CLASS.GRATICULE]: PAL.CHROME,
+    // NIGHTLIT is literally "built-up, lit after dark" — and dim enough that the road network
+    // stays the figure and the city footprint stays the ground.
+    [LINE_CLASS.URBAN]: PAL.NIGHTLIT,
   },
 };
 

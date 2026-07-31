@@ -30,12 +30,25 @@ bordes de área, ASCII semántico para relleno y marcadores.
 
 ## Características
 
-- **Zoom continuo** de 80 000 km a 200 m con una sola proyección, sin transiciones
+- **Zoom continuo** de 292 km a **4 m por celda** con una sola proyección, sin transiciones ni saltos
 - **Realce hipsométrico** con bandas, curvas de nivel, realce solar y sombra costera
-- **Escala urbana** con calles, uso de suelo y manzanas
-- **Funciona offline** — Natural Earth incluido, sin API keys para el planeta base
-- **Preparado para otros cuerpos** — la Tierra no está cableada en ningún lado
+- **Ciudades y labels** con resolución de colisiones, sin taparse entre sí
+- **Red vial y huella urbana** por debajo de 150 km, en geometría real
+- **Calles reales de OpenStreetMap** en braille al acercarse a una ciudad — Bogotá, Tokio, Nueva York
+- **Funciona offline** — Natural Earth y ETOPO1 incluidos, sin API keys y sin red en runtime
+- **Y con red, cobertura ilimitada** — cualquier ciudad se descarga de OSM en el momento; si no hay
+  red, o si OSM no responde, el mapa sigue con lo que trae. La red nunca es un requisito
+- **Preparado para otros cuerpos** — la Tierra no está cableada en ningún lado; `Body` es un tipo,
+  no una constante, y un test dedicado falla si algo hardcodea una constante de la Tierra en el core
+- **Dentro del presupuesto de 10 ms de CPU** por frame, medido con la cámara en movimiento
 - **Contexto geoespacial para agentes de IA** — servidor MCP incluido, ver abajo
+
+El zoom llega hasta la cuadra: a 200 m de altitud una celda cubre 4 m, y lo que se dibuja ahí es la
+red vial real de OpenStreetMap. Las tres ciudades horneadas ocupan 1.4 MB en total y **no tocan la
+red en runtime**; fuera de ellas, si hay conexión, la zona se descarga en el momento por la misma
+ruta de código, así que una ciudad descargada se dibuja igual que una horneada. Agregar una ciudad
+al build es una línea. Lo que falta son los edificios; números medidos en
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Para agentes de IA
 
@@ -62,42 +75,49 @@ caracteres, así que **un humano puede mirar exactamente lo que el modelo recibi
 pnpm --filter @glyphsphere/agent probe 4.711 -74.0721
 ```
 
-Detalle en [`packages/agent/README.md`](packages/agent/README.md); el pitch completo en
-[`PITCH.md`](PITCH.md).
+Detalle completo, incluida la comparación con una API de mapas comercial y las limitaciones de
+precisión de los datasets, en [`packages/agent/README.md`](packages/agent/README.md).
 
-## Documentación
+## Paquetes
 
-El árbol completo de decisiones de diseño vive en `docs/`:
+Monorepo pnpm. `core` no depende de nada del workspace; el resto se apila sobre él.
 
-| | |
+| Paquete | Qué hace |
 |---|---|
-| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline, hilos, paquetes |
-| [`REPOSITORY.md`](docs/REPOSITORY.md) | Dónde va cada archivo |
-| [`RENDERING.md`](docs/RENDERING.md) | Los tres registros, atlas, backends |
-| [`RELIEF.md`](docs/RELIEF.md) | Realce hipsométrico |
-| [`CAMERA.md`](docs/CAMERA.md) | Proyección, zoom, paneo, LOD |
-| [`DATA.md`](docs/DATA.md) | Fuentes geográficas y escala urbana |
-| [`BODIES.md`](docs/BODIES.md) | Abstracción de cuerpo celeste |
-| [`API.md`](docs/API.md) | Superficie pública |
-| [`AESTHETIC.md`](docs/AESTHETIC.md) | Paleta, charsets, tipografía |
-| [`ROADMAP.md`](docs/ROADMAP.md) | Fases y orden de trabajo |
+| [`@glyphsphere/core`](packages/core) | Grid, Camera, Projection, LOD, los tres registros de glifo, LayerStack, atlas de fuente. Sin DOM. |
+| [`@glyphsphere/bodies`](packages/bodies) | El tipo `Body` y el perfil de la Tierra (radio, bandas, paleta, rotación). |
+| [`@glyphsphere/layers`](packages/layers) | Capas: océano, relieve, landmask, ríos/lagos, fronteras, graticule, terminador, ciudades. |
+| [`@glyphsphere/data`](packages/data) | Scripts que generan los assets de `assets/earth/` desde Natural Earth, ETOPO1 y OpenStreetMap. |
+| [`@glyphsphere/agent`](packages/agent) | Contexto geoespacial en texto para LLMs + servidor MCP. |
+| [`@glyphsphere/renderer-canvas`](packages/renderer-canvas) | Backend Canvas2D. |
+| [`apps/playground`](apps/playground) | La demo interactiva que corre `pnpm dev`. |
 
-Además, en la raíz: [`DEPLOY.md`](DEPLOY.md) para levantarlo en otra máquina y
-[`PITCH.md`](PITCH.md) para el porqué.
+Las restricciones de diseño del proyecto viven en [`CLAUDE.md`](CLAUDE.md).
 
 ## Instalación rápida
 
 ```bash
 pnpm install
-pnpm data:build     # 16 MB de Natural Earth + ETOPO1; no están en git
+pnpm data:build     # ~16 MB de Natural Earth + ETOPO1; no están en git
 pnpm dev            # playground en :5173
 ```
 
-Guía completa, incluido el servidor MCP y el despliegue, en [`DEPLOY.md`](DEPLOY.md).
+Servidor MCP y CLI de consulta puntual, en [`packages/agent/README.md`](packages/agent/README.md).
 
 ## Estado
 
-En desarrollo hacia v1, siguiendo [`docs/ROADMAP.md`](docs/ROADMAP.md).
+En desarrollo hacia v1. El roadmap avanza por fases, citadas como `Fase N` en el código:
+
+- ✅ Fase 1 — proyección satelital y disco del planeta a cualquier altitud
+- ✅ Fase 2 — landmask (tierra vs. agua)
+- ✅ Fase 3 — navegación: arrastrar para girar, zoom continuo con la rueda
+- ✅ Fase 4 — relieve batimétrico muestreado (no una profundidad nominal constante)
+- ✅ Fase 5 — ciudades y labels con resolución de colisiones
+- ✅ Fase 6 — escala urbana: red vial y huella construida, offline
+- ✅ Fase 7 — campo de visión: el zoom deja de seguir al horizonte y llega a 4 m/celda
+- ✅ Fase 8 — calles reales de OSM en braille, horneadas y offline
+- ✅ Fase 9 — assets a un tercio, frame sin picos, y cobertura en línea opcional
+- ⬜ Edificios, y tiles genéricos para cubrir el planeta sin enumerar ciudades
 
 ## Contribuir
 
@@ -108,29 +128,5 @@ son por romper una.
 ## Licencia
 
 MIT. Fuente Iosevka bajo SIL OFL. Datos de [Natural Earth](https://www.naturalearthdata.com/)
-(dominio público), GEBCO y ETOPO1.
-
----
-
-## ⚠️ Deploying (Vercel, Render, etc.)
-
-Deploy platforms like **Vercel**, **Render** or **Netlify** can only connect to
-repositories **you own** — they can't be granted access to this organization repo.
-To deploy while keeping your commits here, mirror your code to a personal repo:
-
-1. Create a **personal** repository on your own GitHub account.
-2. Point your local `origin` at **both** repos, so a single `git push` updates each one:
-
-   ```bash
-   # this org repo (keep it as a push target)...
-   git remote set-url --add --push origin https://github.com/platanus-build-night/platanus-build-night-26-co-Andss-ye.git
-   # ...and your personal repo
-   git remote set-url --add --push origin https://github.com/<your-user>/<your-repo>.git
-   ```
-
-   From now on `git push` sends every commit to **both** repositories.
-3. Connect your deploy service (Vercel, Render, …) to your **personal** repo and deploy from there.
-
-Your commits stay mirrored here for judging, while the deploy runs from the repo you control.
-
-Have fun! 🚀
+(dominio público), GEBCO y ETOPO1, y de [OpenStreetMap](https://www.openstreetmap.org/copyright)
+(© contribuidores de OpenStreetMap, ODbL) para la escala de calle.

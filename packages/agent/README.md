@@ -71,7 +71,7 @@ pnpm --filter @glyphsphere/agent mcp
 ```
 
 Expone dos herramientas: `describe_location` y `render_view`. El repositorio trae un
-`.mcp.json` en la raíz, así que Claude Code lo detecta solo. Ver `DEPLOY.md`.
+`.mcp.json` en la raíz, así que Claude Code lo detecta solo.
 
 Sin dependencias: MCP sobre stdio es JSON-RPC en líneas, y los tres métodos que necesita un
 servidor de herramientas están en `src/mcp.ts`.

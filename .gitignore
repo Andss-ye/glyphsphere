@@ -9,6 +9,9 @@ fonts/source/
 packages/data/assets/*
 !packages/data/assets/**/manifest.json
 packages/data/.cache/
-/docs/
+# Los .md de docs/ sí se versionan: ignorarlos enteros es la razón por la que el roadmap y las
+# notas de diseño se perdieron una vez. Lo que sigue fuera es docs/reference/, que son imágenes.
+/docs/*
+!/docs/*.md
 /DEPLOY.md
 /PITCH.md

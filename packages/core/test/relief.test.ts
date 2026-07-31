@@ -5,6 +5,11 @@ import { embossShift, applyShift, EMBOSS_MIN } from '../src/raster/emboss.js';
 import { coastalShadowWidth } from '../src/raster/coastal-shadow.js';
 import { limitBands } from '../src/raster/registers/semantic.js';
 import { PAL } from '../src/palette/palette.js';
+import { Grid } from '../src/grid/grid.js';
+import { LayerStack } from '../src/layers/stack.js';
+import { createPipeline, singleBodyScene } from '../src/pipeline.js';
+import { createViewMetrics } from '../src/projection/aspect.js';
+import { createCameraState } from '../src/camera/state.js';
 import { testBody } from './fixtures.js';
 
 const body = testBody({ rotation: { siderealPeriodHours: 23.9344696, axialTiltDeg: 23.4392811, tidallyLocked: false } });
@@ -162,5 +167,82 @@ describe('band thinning', () => {
     const kept = limitBands(bands, 4);
     expect(kept[0]).toBe(bands[0]);
     expect(kept.at(-1)).toBe(bands.at(-1));
+  });
+});
+
+/**
+ * Los contornos son la mejor herramienta que tiene el proyecto para leer altura, y por eso mismo
+ * no pueden dibujarse donde el dato no llega: por debajo de la resolución de la fuente cada línea
+ * traza la interpolación bilineal, no el suelo. Sobre una ciudad además son ruido que tapa las
+ * calles, que sí están medidas.
+ */
+describe('los contornos no inventan detalle por debajo de la fuente', () => {
+  const body = testBody({
+    bands: [
+      { maxM: 0, glyph: '~', paletteIndex: 2 },
+      { maxM: 9000, glyph: '.', paletteIndex: 5 },
+    ],
+  });
+
+  /** Cuenta celdas braille tras un frame con una rampa de elevación real bajo la cámara. */
+  function brailleCells(altitudeKm: number, elevationSourceM?: number): number {
+    const COLS = 80;
+    const ROWS = 30;
+    const view = createViewMetrics(COLS, ROWS);
+    const grid = new Grid(COLS, ROWS);
+    const pipeline = createPipeline(COLS, ROWS);
+
+    // Una rampa suave: el caso en que la interpolación produce curvas plausibles y falsas.
+    const stack = new LayerStack([
+      {
+        id: 'rampa',
+        kind: 'geometry' as const,
+        visibleAt: () => true,
+        paint(ctx) {
+          ctx.fillElevationField((lon, lat) => Math.round(1000 + lat * 400 + lon * 120));
+        },
+      },
+    ]);
+
+    pipeline.render({
+      scene: singleBodyScene(body),
+      camera: createCameraState(body.id, { lon: 0, lat: 0, altitudeKm }),
+      view,
+      grid,
+      stack,
+      ...(elevationSourceM === undefined ? {} : { relief: { elevationSourceM } }),
+    });
+
+    let braille = 0;
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        const glyph = grid.get(x, y).glyph;
+        if (glyph >= 0x2800 && glyph <= 0x28ff) braille++;
+      }
+    }
+    return braille;
+  }
+
+  // ETOPO1: 40 075 km de circunferencia sobre 4096 muestras.
+  const ETOPO1_M = 40_075_000 / 4096;
+
+  it('los dibuja mientras la celda sea comparable a la muestra', () => {
+    // Desde órbita una celda cubre cientos de kilómetros: cada línea cruza muchas muestras.
+    expect(brailleCells(20_000, ETOPO1_M)).toBeGreaterThan(0);
+  });
+
+  it('deja de dibujarlos cuando la celda es mucho más fina que la muestra', () => {
+    // A escala de ciudad una muestra de ETOPO1 abarca más de cien celdas.
+    expect(brailleCells(2, ETOPO1_M)).toBe(0);
+  });
+
+  it('sin declarar la fuente, se comporta como antes', () => {
+    // El campo es opcional: quien no lo pase conserva el comportamiento previo a esta regla.
+    expect(brailleCells(2)).toBeGreaterThan(0);
+  });
+
+  it('una fuente más fina permite bajar más antes de callar', () => {
+    // El umbral sigue al dato, no a una altitud fija: con muestras de 30 m se dibuja a 2 km.
+    expect(brailleCells(2, 30)).toBeGreaterThan(0);
   });
 });

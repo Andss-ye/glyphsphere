@@ -27,6 +27,9 @@ export interface TerminatorOptions {
   readonly bandWidth?: number;
 }
 
+/** Cells between exact inverse projections. See the note in `draw`. */
+const SPAN_CELLS = 8;
+
 export function terminatorLayer(options: TerminatorOptions = {}): Layer {
   const at = options.at ?? (() => new Date());
   const bandWidth = options.bandWidth ?? 0.06;
@@ -47,32 +50,70 @@ export function terminatorLayer(options: TerminatorOptions = {}): Layer {
         body.bands.filter((band) => band.maxM <= 0).map((band) => band.paletteIndex),
       );
 
+      /** Recolours one cell for a known solar incidence. */
+      const shade = (x: number, y: number, incidence: number): void => {
+        if (incidence > bandWidth) return; // full daylight, leave it alone
+
+        const cell = grid.get(x, y);
+        if (cell.glyph === 0) return;
+
+        // Anything that is not a water band counts as standing above the sea — land, and also
+        // borders and graticule, which should dim at night rather than disappear.
+        const water = waterIndices.has(cell.fg);
+
+        // Keep the glyph, change only the index: that is what preserves the terrain reading.
+        const night =
+          incidence > -bandWidth
+            ? water
+              ? PAL.NIGHTLIT
+              : PAL.ALPINE
+            : water
+              ? PAL.NIGHT
+              : PAL.NIGHTLIT;
+
+        grid.set(x, y, cell.glyph, night, cell.bg);
+      };
+
+      /** Solar incidence at a cell centre, or null where there is no surface under it. */
+      const incidenceAt = (x: number, y: number): number | null => {
+        const lonLat = projection.fromCell([x + 0.5, y + 0.5]);
+        return lonLat ? solarIncidence(lonLat, sun) : null;
+      };
+
+      /**
+       * Incidence varies smoothly across the frame, so it is evaluated every `SPAN` cells and
+       * interpolated between — the same trade `fillElevationField` makes, and for the same
+       * reason: un-projecting is the cost. This ran one inverse projection per cell, 12 726 of
+       * them per frame on a 202x63 grid, most of them to conclude "full daylight, leave it".
+       *
+       * The span is only trusted where its endpoints agree closely; a span whose incidence swings
+       * — near the limb, where the inverse is singular, and near the terminator itself, where the
+       * answer actually matters — falls back to exact. So the precision is spent on the band and
+       * nowhere else.
+       */
+      const smooth = bandWidth / 4;
+
       for (let y = 0; y < grid.rows; y++) {
-        for (let x = 0; x < grid.cols; x++) {
-          const cell = grid.get(x, y);
-          if (cell.glyph === 0) continue;
+        for (let x0 = 0; x0 < grid.cols; x0 += SPAN_CELLS) {
+          const x1 = Math.min(grid.cols - 1, x0 + SPAN_CELLS);
+          const a = incidenceAt(x0, y);
+          const b = x1 === x0 ? a : incidenceAt(x1, y);
 
-          const lonLat = projection.fromCell([x + 0.5, y + 0.5]);
-          if (!lonLat) continue;
+          if (a === null || b === null || Math.abs(a - b) > smooth) {
+            for (let x = x0; x <= x1; x++) {
+              const exact = incidenceAt(x, y);
+              if (exact !== null) shade(x, y, exact);
+            }
+            continue;
+          }
 
-          const incidence = solarIncidence(lonLat, sun);
-          if (incidence > bandWidth) continue; // full daylight, leave it alone
+          // Whole span in daylight: nothing to write, and the endpoints already proved it.
+          if (a > bandWidth && b > bandWidth) continue;
 
-          // Anything that is not a water band counts as standing above the sea — land, and also
-          // borders and graticule, which should dim at night rather than disappear.
-          const water = waterIndices.has(cell.fg);
-
-          // Keep the glyph, change only the index: that is what preserves the terrain reading.
-          const night =
-            incidence > -bandWidth
-              ? water
-                ? PAL.NIGHTLIT
-                : PAL.ALPINE
-              : water
-                ? PAL.NIGHT
-                : PAL.NIGHTLIT;
-
-          grid.set(x, y, cell.glyph, night, cell.bg);
+          const width = x1 - x0;
+          for (let x = x0; x <= x1; x++) {
+            shade(x, y, width === 0 ? a : a + ((b - a) * (x - x0)) / width);
+          }
         }
       }
     },

@@ -251,6 +251,64 @@ export function capRuns(coordinates: readonly Position[]): RunIndexedRing {
 const MIN_RING_POINTS = 32;
 
 /**
+ * Rebuilds a **line** as only the pieces that reach the view, emitting one segment per run of
+ * on-screen runs.
+ *
+ * A line is not a ring: it has no interior, so a stretch that is off screen contributes nothing
+ * and can be dropped outright rather than thinned — which `resolveRing` cannot do, because for a
+ * *fill* the far geometry still has to enclose the right area.
+ *
+ * Dropping has to **split**, not join. Silently skipping a middle run would connect the two runs
+ * either side of it with a straight chord, and where a coastline leaves the view and comes back
+ * that chord is drawn right across the screen. So each contiguous stretch of visible runs becomes
+ * its own polyline, and d3 strokes them separately.
+ *
+ * Runs are kept by `capIsNear` rather than `capIsVisible`, so a run just off screen is still
+ * emitted: a stroke has to arrive from beyond the edge, or every coastline would stop short of
+ * the viewport border.
+ */
+export function resolveLine(
+  ring: RunIndexedRing,
+  view: ViewCap,
+  subcellRad: number,
+  take: () => Position[],
+  emit: (segment: Position[]) => void,
+): void {
+  const { coordinates, caps, meanStepRad } = ring;
+  const last = coordinates.length - 1;
+  if (last < 0) return;
+
+  const stride =
+    subcellRad > 0 && meanStepRad > 0
+      ? Math.max(1, Math.floor(subcellRad / meanStepRad))
+      : 1;
+
+  let segment: Position[] | null = null;
+
+  for (let run = 0; run < caps.length; run++) {
+    if (!capIsNear(caps[run]!, view)) {
+      // The stretch ends here. Anything after it starts a new polyline.
+      if (segment !== null && segment.length >= 2) emit(segment);
+      segment = null;
+      continue;
+    }
+
+    if (segment === null) {
+      segment = take();
+      segment.length = 0;
+    }
+
+    const start = run * RUN_LENGTH;
+    const end = Math.min(last, start + RUN_LENGTH);
+    for (let i = start; i <= end; i += stride) segment.push(coordinates[i]!);
+    // The run's final point, so the join to the next run has no gap.
+    if (segment[segment.length - 1] !== coordinates[end]) segment.push(coordinates[end]!);
+  }
+
+  if (segment !== null && segment.length >= 2) emit(segment);
+}
+
+/**
  * Rebuilds a ring at the detail the view can show near the camera, and thinned further
  * everywhere else.
  *
