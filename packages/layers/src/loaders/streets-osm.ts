@@ -286,11 +286,18 @@ export interface OnlineStreetsOptions {
  * más y responde en 0.6 s con HTTP 200 y CORS correcto — pero es la instancia *suiza* y solo
  * carga Suiza, así que a cualquier consulta fuera de ahí contesta 200 con cero elementos. Un
  * espejo regional no falla: miente, y su mentira es indistinguible de "aquí no hay calles".
+ *
+ * **Y que sean distintos también.** `overpass.kumi.systems` estaba en esta lista y era un CNAME de
+ * `overpass.private.coffee` — el mismo servidor, la misma IP. Dos entradas, un solo espejo: cuando
+ * ese host acepta la conexión y no contesta (medido, así estaba), la lista de "tres" gastaba dos
+ * plazos seguidos contra la misma máquina muerta. Lo reemplaza `maps.mail.ru`, verificado a mano:
+ * cobertura mundial (contestó Bogotá desde una consulta de prueba), 7 s, y
+ * `Access-Control-Allow-Origin: *`. Antes de agregar un espejo, resolvé su nombre.
  */
 const DEFAULT_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
 /**
@@ -304,14 +311,28 @@ const DEFAULT_MIRRORS = [
  * lo que pasó durante esta sesión: `overpass-api.de` empezó a rechazar la conexión al instante
  * mientras otro espejo seguía respondiendo 200.
  *
- * 25 s porque la consulta ligera se sirve en unos pocos: medido, París entero en 3.7 s. Un
- * espejo que no ha contestado una consulta así en veinticinco segundos no está trabajando, está
- * encolando.
- *
  * Es el presupuesto de **toda** la búsqueda, no de cada espejo: ver `deadline` más abajo. Cuando
  * era por espejo, una zona que ninguno podía servir tardaba entre 60 y 187 segundos en admitirlo.
+ *
+ * 20 s porque la consulta ligera se sirve en unos pocos: medido, París entero en 3.7 s y un cuadro
+ * de Bogotá en 7.1 s contra un espejo sano. Un espejo que no ha contestado una consulta así no
+ * está trabajando, está encolando.
  */
-const DEFAULT_TIMEOUT_MS = 25_000;
+const DEFAULT_TIMEOUT_MS = 20_000;
+
+/**
+ * Y cuánto se le da **a un espejo**, dentro de ese presupuesto.
+ *
+ * Sin esto el plazo compartido tiene un agujero: los espejos se prueban en cadena, así que el
+ * primero que acepta la conexión y no contesta se lleva los veinticinco segundos enteros y los
+ * demás no llegan a recibir la consulta. No es hipotético — medido, `overpass.private.coffee`
+ * mantiene el TLS abierto y no responde en 45 s. Con el tope, un espejo colgado cuesta su parte y
+ * el siguiente todavía tiene presupuesto para contestar.
+ *
+ * Es también el plazo que se le declara al servidor: pedirle más de lo que se va a esperar deja a
+ * Overpass trabajando para nadie y gasta el turno igual.
+ */
+const PER_MIRROR_TIMEOUT_MS = 12_000;
 
 /**
  * Cuánto se aparta un espejo que acaba de fallar.
@@ -417,38 +438,66 @@ export function slotWaitSeconds(status: string): number {
  *
  * De paso resuelve lo otro: si el espejo dice que no tiene turno libre hasta dentro de N segundos,
  * se le cree y se le espera, en vez de insistir y llevarse un 429.
+ *
+ * **Lo que no puede hacer es vetar la consulta cuando no se pudo sondear**, y ese era el fallo que
+ * dejaba el mapa mudo. Un sondeo que revienta no dice "el espejo está ocupado", dice "no sé": el
+ * endpoint `/status` puede no servir CORS aunque `/interpreter` sí, el preflight puede caerse, la
+ * red puede cortarse un segundo. Se contaba como "no utilizable", los tres daban lo mismo, y
+ * `fetchOnlineStreets` devolvía `unavailable` **sin mandar una sola consulta**. Ese es literalmente
+ * el síntoma: ni calles, ni peticiones, ni un código de estado que mirar. Y como la política de
+ * arriba abandona una zona a los tres fallos, se rendía para toda la sesión sin haber preguntado.
+ *
+ * Así que el veto exige una respuesta explícita: solo si **todos** contestaron y todos dijeron que
+ * no tienen turno. Un `unknown` manda a intentarlo.
  */
+type MirrorHealth = 'ready' | 'busy' | 'unknown';
+
 async function probeMirrors(mirrors: readonly string[]): Promise<boolean> {
   const now = Date.now();
   if (now - lastProbeMs < PROBE_INTERVAL_MS) return false;
   lastProbeMs = now;
 
-  const usable = await Promise.all(
-    mirrors.map(async (mirror) => {
+  const health = await Promise.all(
+    mirrors.map(async (mirror): Promise<MirrorHealth> => {
       try {
         const response = await fetch(statusUrlFor(mirror), {
-          // El mismo User-Agent que la consulta, y por el mismo motivo: sin él Overpass responde
-          // 406. Sin esto el sondeo se envenenaba solo — daba por muertos a los tres espejos y la
-          // búsqueda se rendía en medio segundo con todos disponibles.
-          headers: { 'User-Agent': USER_AGENT },
+          // El mismo trato que la consulta: se identifica en Node, y en el navegador no manda
+          // nada que fuerce un preflight. Ver REQUEST_HEADERS.
+          headers: REQUEST_HEADERS,
           signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
         });
         if (!response.ok) {
           mirrorBenchedUntil.set(mirror, Date.now() + BUSY_COOLDOWN_MS);
-          return false;
+          return 'busy';
         }
         const waitMs = slotWaitSeconds(await response.text()) * 1000;
         if (waitMs > 0) mirrorBenchedUntil.set(mirror, Date.now() + waitMs);
         else mirrorBenchedUntil.delete(mirror);
-        return waitMs <= GRACE_MS;
+        return waitMs <= GRACE_MS ? 'ready' : 'busy';
       } catch {
-        mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
-        return false;
+        /**
+         * Se aparta —que solo lo manda al final de la cola— pero **no cuenta para el veto**.
+         *
+         * Son dos cosas distintas y confundirlas es lo que rompía el mapa. Apartarlo es útil: si
+         * de verdad está caído, se prueba el último y no se le paga el plazo primero. Vetar la
+         * búsqueda entera es otra cosa, y para eso hace falta que el espejo lo *diga*, no que no
+         * conteste: en el navegador un sondeo puede fallar por CORS mientras `/interpreter`
+         * funciona perfectamente.
+         *
+         * Y no pisa un castigo ya puesto: lo que midió una consulta de verdad vale más que un
+         * sondeo que no llegó. Sin esta guarda, un espejo que solo estaba ocupado (45 s) pasaba a
+         * cinco minutos porque su `/status` no contestó, y se perdía el orden que hace que la
+         * siguiente consulta empiece por el que antes va a responder.
+         */
+        if ((mirrorBenchedUntil.get(mirror) ?? 0) <= Date.now()) {
+          mirrorBenchedUntil.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
+        }
+        return 'unknown';
       }
     }),
   );
 
-  return !usable.some(Boolean);
+  return health.every((state) => state === 'busy');
 }
 
 /**
@@ -467,11 +516,28 @@ const DEFAULT_HALF_SPAN_DEG = 0.035;
 /**
  * Overpass responde 406 a un User-Agent anónimo, y el de Node lo es.
  *
- * En el navegador `User-Agent` es una cabecera prohibida y se ignora en silencio, así que ponerla
- * es inocuo ahí y es la diferencia entre que haya datos y que no en Node — donde corre el CLI de
- * `@glyphsphere/agent`.
+ * En Node es la diferencia entre que haya datos y que no — ahí corre el CLI de
+ * `@glyphsphere/agent` y el horneado de `packages/data`.
  */
 const USER_AGENT = 'glyphsphere/0.1 (offline map, live fallback)';
+
+/**
+ * Solo en Node. **En el navegador, mandarla es lo que rompe la consulta.**
+ *
+ * Se creía inocua porque `User-Agent` era una cabecera prohibida que el navegador ignoraba en
+ * silencio. Dejó de serlo: hoy es una cabecera de autor más, y como no está en la lista blanca de
+ * CORS convierte la petición en *no simple* y obliga a un preflight `OPTIONS`. Sin la cabecera,
+ * un POST con cuerpo `x-www-form-urlencoded` es una petición simple y sale directa.
+ *
+ * Y el preflight no es un round-trip de más, es un muro: `maps.mail.ru` contesta
+ * `Access-Control-Allow-Headers: Authorization, Content-Type, X-Maps-Platform,
+ * X-Maps-Access-Token` — sin `user-agent`, o sea preflight rechazado. Eso es lo que el navegador
+ * enseña como una petición fallida **sin código de estado**, que es justo lo que se veía.
+ *
+ * El navegador manda su propio User-Agent igual, así que el 406 no aplica ahí.
+ */
+const NODE = (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node;
+const REQUEST_HEADERS: Record<string, string> = NODE ? { 'User-Agent': USER_AGENT } : {};
 
 /**
  * ¿Hay red? `navigator.onLine` en el navegador, y en Node se asume que sí.
@@ -525,9 +591,11 @@ export async function fetchOnlineStreets(
 
   const mirrors = options.mirrors ?? DEFAULT_MIRRORS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  // El servidor recibe el mismo plazo que espera el cliente: colgar antes no libera su turno.
+  const perMirrorMs = Math.min(timeoutMs, PER_MIRROR_TIMEOUT_MS);
+  // El servidor recibe el mismo plazo que espera el cliente para *esa* consulta: colgar antes no
+  // libera su turno, y pedirle más de lo que se va a esperar lo pone a trabajar para nadie.
   const body = new URLSearchParams({
-    data: overpassQuery(bbox, Math.floor(timeoutMs / 1000)),
+    data: overpassQuery(bbox, Math.floor(perMirrorMs / 1000)),
   });
 
   /**
@@ -562,9 +630,12 @@ export async function fetchOnlineStreets(
     try {
       const response = await fetch(mirror, {
         method: 'POST',
-        headers: { 'User-Agent': USER_AGENT },
+        headers: REQUEST_HEADERS,
         body,
-        signal: deadline,
+        // El plazo compartido **y** el de este espejo: el que salte primero corta. Sin el
+        // segundo, un espejo colgado se lleva el presupuesto entero y el siguiente no llega a
+        // preguntarse nada.
+        signal: AbortSignal.any([deadline, AbortSignal.timeout(perMirrorMs)]),
       });
       if (!response.ok) {
         // 429 y 504 son "estoy ocupado", no "estoy roto".
