@@ -232,31 +232,76 @@ function streetUrlFor(file: string): string | undefined {
  * Toda la cortesía con Overpass (una consulta en vuelo, espera creciente, rendición) vive en el
  * origen, no acá: esto se llama una vez por frame y tiene que ser barato y no repetir.
  */
+/**
+ * Se consulta **el proxy del mismo origen**, no los espejos públicos.
+ *
+ * Desde una conexión doméstica normal, dos de los tres espejos son inalcanzables —
+ * `overpass-api.de` rechaza la conexión y `overpass.private.coffee` no contesta nunca — y como el
+ * cliente los prueba en cadena, el presupuesto se agotaba antes de llegar al que sirve. En la
+ * consola eran dos `ERR_CONNECTION_REFUSED` sin código de estado y un mapa sin calles.
+ *
+ * Con el proxy el navegador hace una sola petición, a su propio origen: sin CORS, sin preflight,
+ * y con la elección de espejo pagada una vez en el servidor. Ver `api/overpass.ts`.
+ *
+ * Un espejo solo, así que el plazo entero es suyo: no hay nadie a quien proteger de él.
+ */
+const OVERPASS_PROXY = '/api/overpass';
+
 const onlineStreets = createOnlineStreetSource({
   radiusKm: earth.radiusKm,
   maxAltitudeKm: STREETS_ALTITUDE_KM,
+  mirrors: [OVERPASS_PROXY],
+  // Lo que tarda un cuadro urbano denso contra un espejo sano, medido: unos diez segundos. El
+  // resto es margen para el arranque en frío de la función, que corre los tres espejos a la vez.
+  timeoutMs: 25_000,
   onTile: (tile) => {
     streets.push(tile);
     rebuildStack();
   },
 });
 
+/**
+ * ¿Hay ya calles **dibujables** sobre este punto?
+ *
+ * Un tile cargado con cero vías no es cobertura, y tratarlo como tal es lo que dejaba el mapa
+ * mudo: el manifiesto anunciaba Bogotá, la capa daba la zona por resuelta, y la red no llegaba a
+ * intentarse nunca.
+ */
+function coveredHere(lon: number, lat: number): boolean {
+  return streets.some(
+    ({ bbox, roads }) =>
+      roads.length > 0 && lon >= bbox[0] && lon <= bbox[2] && lat >= bbox[1] && lat <= bbox[3],
+  );
+}
+
 async function loadStreetsFor(lon: number, lat: number, altitudeKm: number): Promise<void> {
   if (altitudeKm > STREETS_ALTITUDE_KM) return;
 
   const meta = streetsMeta as unknown as StreetsMeta;
   const tile = tileAt(meta.tiles, lon, lat);
+  const url = tile ? streetUrlFor(tile.file) : undefined;
 
   // Primero lo horneado, siempre: es el piso garantizado y no depende de nadie.
-  if (tile) {
-    if (streetsRequested.has(tile.id)) return;
-    const url = streetUrlFor(tile.file);
-    if (!url) return;
-
-    streetsRequested.add(tile.id);
-    streets.push(await loadStreetTile(url, meta, tile));
-    rebuildStack();
-    return;
+  if (tile && url) {
+    if (!streetsRequested.has(tile.id)) {
+      streetsRequested.add(tile.id);
+      try {
+        const baked = await loadStreetTile(url, meta, tile);
+        // Un tile sin vías no se guarda: guardarlo solo sirve para bloquear la red detrás de él.
+        if (baked.roads.length > 0) {
+          streets.push(baked);
+          rebuildStack();
+        }
+      } catch (error) {
+        // El archivo puede no estar en el deploy o venir roto. Eso no puede tumbar el ciclo: si
+        // lanza acá, nadie llama a la red y la zona queda muerta sin que nada lo diga.
+        console.warn(`calles horneadas de ${tile.id}: no se pudieron cargar`, error);
+      }
+    }
+    // **Y solo se vuelve si de verdad hay algo que dibujar.** Que el manifiesto nombre la ciudad
+    // no basta: el archivo puede faltar del deploy o venir vacío, y ahí es cuando más falta hace
+    // la red. Rendirse en silencio era el peor final posible — ni calles, ni petición, ni aviso.
+    if (coveredHere(lon, lat)) return;
   }
 
   // El ancho de la vista en grados: sin él solo se pediría el cuadro bajo la cámara, que a
@@ -271,7 +316,43 @@ async function loadStreetsFor(lon: number, lat: number, altitudeKm: number): Pro
     Math.max(0.2, Math.cos((lat * Math.PI) / 180));
 
   onlineStreets.request(lon, lat, altitudeKm, visibleWidthDeg);
+  keepPollingStreets();
 }
+
+/**
+ * Cuánto se espera entre dos comprobaciones con la cámara quieta.
+ *
+ * No es un bucle de render: es un cuadro cada dos segundos mientras haya una descarga en marcha o
+ * un reintento pendiente, y ninguno cuando no.
+ */
+const STREET_POLL_MS = 2_000;
+let streetPollHandle = 0;
+
+/**
+ * Mantiene vivo el ciclo de calles mientras la red tenga trabajo pendiente.
+ *
+ * **Sin esto la política de reintentos era inalcanzable.** El bucle de render se detiene solo
+ * cuando la cámara se asienta — es la palanca que evita que el ventilador arranque en reposo — y
+ * `loadStreetsFor` solo se llama desde ahí. Así que al pararse sobre una ciudad: se dispara una
+ * consulta, falla, se apunta un reintento a los 20 s… y nadie vuelve a preguntar nunca, porque
+ * quien preguntaba era el cuadro que ya no se dibuja. Desde fuera, "me paro en la ciudad y no pasa
+ * nada" — literalmente cierto, y con las esperas crecientes de 20 s, 90 s y 5 min ahí escritas sin
+ * llegar a usarse jamás.
+ *
+ * Se apaga solo: en cuanto el estado deja de ser "trabajando", no se encola otro.
+ */
+function keepPollingStreets(): void {
+  if (streetPollHandle !== 0) return;
+  if (onlineStreets.status !== 'fetching' && onlineStreets.status !== 'retrying') return;
+
+  streetPollHandle = window.setTimeout(() => {
+    streetPollHandle = 0;
+    requestFrame();
+  }, STREET_POLL_MS);
+}
+
+/** Volver a tener red es motivo para reintentar: el origen se rindió por no tenerla. */
+window.addEventListener('online', () => requestFrame());
 
 /**
  * Qué decir en el panel. Distingue las situaciones que el usuario puede resolver de las que no:
@@ -294,7 +375,11 @@ function streetsStatus(lon: number, lat: number, altitudeKm: number): string {
     const otros = streets.length - aqui.length;
     return `${aqui.map((t) => t.name).join(', ')}  ${vias} vías${otros > 0 ? ` (+${otros} en caché)` : ''}`;
   }
-  if (tileAt((streetsMeta as unknown as StreetsMeta).tiles, lon, lat)) return 'cargando…';
+  // "cargando…" solo mientras de verdad se esté cargando el horneado. Si ya se resolvió y no
+  // trajo calles, lo que manda es lo que esté haciendo la red — decir "cargando" para siempre
+  // esconde exactamente el fallo que hubo en producción.
+  const bakedHere = tileAt((streetsMeta as unknown as StreetsMeta).tiles, lon, lat);
+  if (bakedHere && !streetsRequested.has(bakedHere.id)) return 'cargando…';
   if (altitudeKm > STREETS_ALTITUDE_KM) return 'sin datos aquí';
 
   switch (onlineStreets.status) {

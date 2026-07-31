@@ -12,6 +12,7 @@ import {
   decodeStreets,
   encodeOsmStreets,
   fetchOnlineStreets,
+  geometryOf,
   isOnline,
   overpassQuery,
   resetMirrorHealth,
@@ -114,6 +115,45 @@ describe('chainWays', () => {
   });
 });
 
+/**
+ * La forma en que Overpass devuelve la geometría **hoy**, que no es la de siempre.
+ *
+ * `out geom;` sobre vías normales da `geometry: [{lon, lat}, ...]`. La consulta actual pasa por
+ * `convert`, y entonces da geometría GeoJSON: `{type: 'LineString', coordinates: [[lon, lat], ...]}`.
+ *
+ * No es un detalle de formato: es el fallo que vació las tres ciudades horneadas en producción.
+ * Quien mira `way.geometry.length` en vez de llamar a `geometryOf` lee `undefined` sobre un objeto
+ * y descarta **todas** las vías, y el resultado es un tile válido, de 71 bytes, con cero calles.
+ * Hasta acá no había un solo test que usara la forma que la consulta produce de verdad.
+ */
+describe('la geometría que devuelve la consulta con `convert`', () => {
+  const geoJsonWay = (cls: string, coordinates: [number, number][]): OverpassWay => ({
+    type: 'way',
+    id: ++id,
+    tags: { cls },
+    geometry: { type: 'LineString', coordinates },
+  });
+
+  it('lee las coordenadas de las dos formas, y da las mismas', () => {
+    const points: [number, number][] = [[-74.07, 4.65], [-74.06, 4.66]];
+    expect(geometryOf(geoJsonWay('primary', points))).toEqual(points);
+    expect(geometryOf(way({ highway: 'primary' }, points))).toEqual(points);
+  });
+
+  it('encadena y hornea la forma GeoJSON en vez de descartarla', () => {
+    const chained = chainWays([
+      geoJsonWay('primary', [[-74.07, 4.65], [-74.06, 4.66]]),
+      geoJsonWay('primary', [[-74.06, 4.66], [-74.05, 4.67]]),
+    ]);
+    expect(chained).toHaveLength(1);
+    expect(chained[0]!.points).toHaveLength(3);
+
+    // Y llega hasta los bytes: un tile con vías, no un encabezado vacío.
+    expect(encodeOsmStreets([geoJsonWay('primary', [[-74.07, 4.65], [-74.06, 4.66]])], BBOX,
+      earth.radiusKm).wayCount).toBe(1);
+  });
+});
+
 describe('el origen en línea produce el mismo tile que el horneado', () => {
   const ways = [
     way({ highway: 'primary' }, [[-74.1, 4.6], [-74.09, 4.605], [-74.08, 4.6]]),
@@ -172,6 +212,17 @@ function fetchFalso(porUrl: (url: string) => unknown) {
 /** Espejos de mentira con la forma real, para que `/interpreter` -> `/status` funcione. */
 const UNO = 'https://uno.invalid/api/interpreter';
 const DOS = 'https://dos.invalid/api/interpreter';
+
+/**
+ * La consulta viaja en la URL, no en el cuerpo: se pide con GET para que la respuesta tenga URL
+ * propia y la puedan guardar tanto el navegador como un CDN. Así que identificar un espejo es
+ * mirar el prefijo, no comparar la URL entera.
+ */
+const esEspejo = (url: unknown, mirror: string): boolean => String(url).startsWith(`${mirror}?`);
+
+/** Lo que se pidió, leído de la URL. */
+const consultaDe = (url: unknown): string =>
+  new URL(String(url), 'http://base.invalid').searchParams.get('data') ?? '';
 
 /**
  * Lo que hay que poder afirmar del modo en línea es **negativo**: que nunca sea la razón de que
@@ -238,7 +289,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
 
   it('un espejo que revienta no impide que el siguiente conteste', async () => {
     globalThis.fetch = fetchFalso((url) =>
-      url === UNO
+      esEspejo(url, UNO)
         ? { ok: true, json: async () => ({ elements: [], remark: 'runtime error: out of memory' }) }
         : respondeCon([CALLE()]),
     ) as unknown as typeof fetch;
@@ -250,23 +301,64 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     expect(result.status).toBe('ok');
   });
 
-  it('le declara al servidor el mismo plazo que espera el cliente', async () => {
+  it('le declara al servidor el plazo que ese espejo va a recibir, no el total', async () => {
     /**
      * Pedir `[timeout:180]` y colgar a los 30 s deja a Overpass trabajando 150 s en un resultado
      * que nadie va a recibir. Reparte turnos por IP contando el trabajo *pedido*, así que abortar
      * temprano no libera nada — y con unas pocas consultas así deja de aceptar la conexión.
+     *
+     * El plazo que cuenta es el **del espejo**, no el de la búsqueda entera: es lo que esa
+     * consulta va a esperar de verdad antes de que se corte.
+     */
+    const fetchSpy = fetchFalso(() => respondeCon([CALLE()]));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const consultas = (): string[] =>
+      fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status')).map(([u]) => consultaDe(u));
+
+    // Con varios espejos manda el tope por espejo: nadie puede quedarse el presupuesto entero.
+    await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+      timeoutMs: 45_000,
+    });
+    expect(consultas()[0]).toContain('[timeout:12]');
+
+    // Y un presupuesto más corto que el tope manda igual: nunca se pide más de lo que se espera.
+    fetchSpy.mockClear();
+    await fetchOnlineStreets(-74.2, 4.9, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+      timeoutMs: 5_000,
+    });
+    expect(consultas()[0]).toContain('[timeout:5]');
+  });
+
+  it('con un solo espejo, el presupuesto entero es suyo', async () => {
+    /**
+     * El tope por espejo existe para que uno colgado no deje sin turno a los demás. Con uno solo
+     * no hay a quién proteger, y recortarlo sería regalar presupuesto — que es exactamente el caso
+     * del proxy del mismo origen, donde la única espera legítima es la de la consulta.
      */
     const fetchSpy = vi.fn().mockResolvedValue(respondeCon([CALLE()]));
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
-    await fetchOnlineStreets(-74.07, 4.65, { ...options, timeoutMs: 45_000 });
-    const body = fetchSpy.mock.calls[0]![1]!.body as URLSearchParams;
-    expect(body.get('data')).toContain('[timeout:45]');
+    await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: ['/api/overpass'],
+      timeoutMs: 25_000,
+    });
+
+    const [url] = fetchSpy.mock.calls[0]!;
+    expect(consultaDe(url)).toContain('[timeout:25]');
+    // Y con un espejo solo no hay nada que sondear: una petición, la consulta.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(url).startsWith('/api/overpass?')).toBe(true);
   });
 
   it('prueba el siguiente espejo cuando el primero falla', async () => {
     const fetchSpy = fetchFalso((url) => {
-      if (url === UNO) throw new Error('timeout');
+      if (esEspejo(url, UNO)) throw new Error('timeout');
       return respondeCon([CALLE()]);
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -287,7 +379,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
      * durante minutos.
      */
     const fetchSpy = fetchFalso((url) => {
-      if (url === UNO) throw new Error('ECONNREFUSED');
+      if (esEspejo(url, UNO)) throw new Error('ECONNREFUSED');
       return respondeCon([CALLE()]);
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -299,7 +391,7 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     }
 
     // El caído se prueba una vez y queda apartado; las tres consultas siguientes no lo tocan.
-    expect(fetchSpy.mock.calls.filter(([url]) => url === UNO)).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([url]) => esEspejo(url, UNO))).toHaveLength(1);
   });
 
   it('si todos los espejos están apartados, lo intenta igual', async () => {
@@ -324,10 +416,19 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
      * milisegundos y vuelve antes. Sin ordenarlos, una consulta de tres segundos se convertía en
      * un minuto de espera porque se probaban primero los colgados.
      */
-    const colgado = 'https://colgado.invalid';
-    const ocupado = 'https://ocupado.invalid';
+    // Con la forma real, para que el sondeo se distinga de la consulta: si los dos van a la misma
+    // URL no se puede afirmar cuál se pidió primero, que es justo lo que este test mide.
+    const colgado = 'https://colgado.invalid/api/interpreter';
+    const ocupado = 'https://ocupado.invalid/api/interpreter';
+    // Ninguno contesta su estado — es como se porta un espejo colgado de verdad — así que el
+    // sondeo no puede decidir el orden y decide lo que costó la consulta anterior.
+    const sinEstado = (url: string): unknown | undefined =>
+      url.endsWith('/status') ? Promise.reject(new Error('sin respuesta')) : undefined;
+
     const fetchSpy = vi.fn().mockImplementation((url: string) => {
-      if (url === colgado) return Promise.reject(new Error('TimeoutError'));
+      const estado = sinEstado(url);
+      if (estado) return estado;
+      if (esEspejo(url, colgado)) return Promise.reject(new Error('TimeoutError'));
       return Promise.resolve({ ok: false, status: 504 });
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
@@ -337,16 +438,19 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors });
 
     fetchSpy.mockClear();
-    fetchSpy.mockImplementation((url: string) =>
-      url === colgado
+    fetchSpy.mockImplementation((url: string) => {
+      const estado = sinEstado(url);
+      if (estado) return estado;
+      return esEspejo(url, colgado)
         ? Promise.reject(new Error('TimeoutError'))
-        : Promise.resolve(respondeCon([CALLE()])),
-    );
+        : Promise.resolve(respondeCon([CALLE()]));
+    });
 
     const result = await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors });
     expect(result.status).toBe('ok');
     // El que menos castigo tenía va primero: se resuelve sin pagar el plazo del colgado.
-    expect(fetchSpy.mock.calls[0]![0]).toBe(ocupado);
+    const consultas = fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'));
+    expect(esEspejo(consultas[0]![0], ocupado)).toBe(true);
   });
 
   it('sondea el estado antes de gastar el plazo contra un espejo que no está', async () => {
@@ -396,7 +500,32 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
     expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status'))).toHaveLength(0);
   });
 
-  it('el sondeo se identifica, igual que la consulta', async () => {
+  it('un sondeo que no llega no impide la consulta', async () => {
+    /**
+     * **El fallo que dejaba el mapa mudo en producción.** Un sondeo que revienta no dice "el
+     * espejo está ocupado", dice "no sé": `/status` puede no servir CORS aunque `/interpreter` sí,
+     * el preflight puede caerse, la red puede parpadear. Se contaba como no utilizable, con todos
+     * los espejos igual, y la búsqueda devolvía `unavailable` **sin mandar una sola consulta** —
+     * ni calles, ni petición en la pestaña de red, ni un código de estado que mirar. Y a los tres
+     * fallos la zona quedaba abandonada para toda la sesión, sin haber preguntado nunca.
+     */
+    const fetchSpy = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith('/status')) return Promise.reject(new TypeError('Failed to fetch'));
+      return Promise.resolve(respondeCon([CALLE()]));
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await fetchOnlineStreets(-74.07, 4.65, {
+      radiusKm: earth.radiusKm,
+      mirrors: [UNO, DOS],
+    });
+
+    expect(result.status).toBe('ok');
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith('/status')).length)
+      .toBeGreaterThan(0);
+  });
+
+  it('en Node se identifica, en la consulta y en el sondeo', async () => {
     /**
      * Overpass responde 406 a un User-Agent anónimo, y el de Node lo es. Cuando el sondeo no lo
      * mandaba, se envenenaba solo: daba por muertos a los tres espejos y la búsqueda se rendía en
@@ -408,10 +537,43 @@ describe('el modo en línea nunca es la fuente de verdad', () => {
 
     await fetchOnlineStreets(-74.07, 4.65, { radiusKm: earth.radiusKm, mirrors: [UNO, DOS] });
 
-    const sondeos = fetchSpy.mock.calls.filter(([u]) => String(u).endsWith('/status'));
-    expect(sondeos.length).toBeGreaterThan(0);
-    for (const [, init] of sondeos) {
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(0);
+    for (const [, init] of fetchSpy.mock.calls) {
       expect((init as RequestInit).headers).toHaveProperty('User-Agent');
+    }
+  });
+
+  it('en el navegador no manda ninguna cabecera que fuerce un preflight', async () => {
+    /**
+     * **La otra mitad de por qué no había ni un código de estado que mirar.** `User-Agent` dejó de
+     * ser una cabecera prohibida que el navegador ignora: hoy es una cabecera de autor, y como no
+     * está en la lista blanca de CORS convierte un POST simple en uno con preflight `OPTIONS`.
+     * `maps.mail.ru` contesta `Access-Control-Allow-Headers: Authorization, Content-Type,
+     * X-Maps-Platform, X-Maps-Access-Token` — sin `user-agent`, o sea preflight rechazado y la
+     * petición cae antes de existir.
+     *
+     * Sin cabeceras propias, el POST con cuerpo `x-www-form-urlencoded` es una petición simple y
+     * sale directa. El navegador manda su propio User-Agent igual, así que el 406 no aplica ahí.
+     */
+    const process = globalThis.process;
+    try {
+      // @ts-expect-error se quita a propósito: es como se ve el módulo desde un navegador.
+      delete globalThis.process;
+      vi.resetModules();
+      const modulo = await import('../src/loaders/streets-osm.js');
+
+      const fetchSpy = vi.fn().mockResolvedValue(respondeCon([CALLE()]));
+      globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+      await modulo.fetchOnlineStreets(-74.07, 4.65, options);
+
+      expect(fetchSpy).toHaveBeenCalled();
+      for (const [, init] of fetchSpy.mock.calls) {
+        expect((init as RequestInit).headers).toEqual({});
+      }
+    } finally {
+      globalThis.process = process;
+      vi.resetModules();
     }
   });
 
@@ -538,8 +700,8 @@ describe('la política de cortesía del origen en línea', () => {
    * cuadros vecinos, el codificador la recorta, y el resultado es "aquí no hay calles" — que es
    * una respuesta legítima y hace pasar el test por el motivo equivocado.
    */
-  function calleEnLaCaja(init: RequestInit | undefined): OverpassWay[] {
-    const data = (init?.body as URLSearchParams | undefined)?.get('data') ?? '';
+  function calleEnLaCaja(url: unknown): OverpassWay[] {
+    const data = consultaDe(url);
     const m = /\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)/.exec(data);
     if (!m) return [];
     const [minLat, minLon, maxLat, maxLon] = m.slice(1).map(Number) as [
@@ -566,11 +728,11 @@ describe('la política de cortesía del origen en línea', () => {
      * ancho de la pantalla a 25 km de altitud. El tile llegaba bien y no se veía nada: un parche
      * diminuto en mitad de una vista mucho más ancha.
      */
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
 
     const source = createOnlineStreetSource(nunca);
@@ -596,11 +758,11 @@ describe('la política de cortesía del origen en línea', () => {
   });
 
   it('no acumula ciudades sin fin al pasear por el mundo', async () => {
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
     const source = createOnlineStreetSource(nunca);
 
@@ -618,12 +780,12 @@ describe('la política de cortesía del origen en línea', () => {
      * aunque quien llama pida menos.
      */
     let consultas = 0;
-    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith('/status')) {
         return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
       }
       consultas++;
-      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+      return Promise.resolve(respondeCon(calleEnLaCaja(url)));
     }) as unknown as typeof fetch;
 
     const source = createOnlineStreetSource({ ...nunca, maxTiles: 2 });
