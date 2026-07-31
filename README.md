@@ -14,7 +14,7 @@ Platanus Build Night — Bogotá @ Buk
 
 Hacker:
 
-- Andres Esteban Rodriguez Avila ([@Andss-ye](https://github.com/Andss-ye))
+- Andrew ([@Andss-ye](https://github.com/Andss-ye))
 
 ## Qué es
 
