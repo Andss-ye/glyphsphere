@@ -642,6 +642,58 @@ export interface OnlineStreetSourceOptions extends OnlineStreetsOptions {
   readonly maxAltitudeKm?: number;
   /** Se llama al llegar un tile. Los bytes vienen para poder guardarlos y no volver a pedirlos. */
   readonly onTile?: (tile: StreetTile, bytes: Uint8Array) => void;
+  /**
+   * Cuántos tiles se guardan como mucho. Al pasarse se sueltan los más lejanos a la cámara.
+   *
+   * Existe porque pasear por el mundo iría acumulando ciudades en memoria para siempre. No es un
+   * problema de dibujo — con dieciséis tiles el cuadro cuesta lo mismo que con uno, porque un
+   * tile fuera de vista se rechaza con un producto punto — sino de memoria.
+   */
+  readonly maxTiles?: number;
+}
+
+/** Cuántos cuadros de rejilla se piden alrededor del que está bajo la cámara. */
+const MAX_RING = 2;
+
+/**
+ * Los cuadros que cubren lo que se ve, del centro hacia afuera.
+ *
+ * **Un solo cuadro no alcanza, y esa fue una regresión real.** El cuadro se achicó a 0.07° para
+ * que Overpass lo sirviera sin ahogarse, y a esa medida cubre el 7 % del ancho de la pantalla a
+ * 25 km de altitud y el 17 % a 10 km: el tile llegaba bien y en pantalla no se veía nada, porque
+ * era un parche diminuto en mitad de una vista mucho más ancha.
+ *
+ * Se devuelven ordenados por cercanía al centro, que es el orden en que conviene pedirlos: lo que
+ * el usuario está mirando primero.
+ */
+export function tilesCovering(
+  lon: number,
+  lat: number,
+  visibleWidthDeg: number,
+  halfSpanDeg: number = DEFAULT_HALF_SPAN_DEG,
+): { id: string; lon: number; lat: number }[] {
+  const span = 2 * halfSpanDeg;
+  const ring = Math.min(MAX_RING, Math.max(0, Math.round(visibleWidthDeg / span / 2)));
+  const centreLon = (Math.floor(lon / span) + 0.5) * span;
+  const centreLat = (Math.floor(lat / span) + 0.5) * span;
+
+  const out: { id: string; lon: number; lat: number; d: number }[] = [];
+  for (let dy = -ring; dy <= ring; dy++) {
+    for (let dx = -ring; dx <= ring; dx++) {
+      const tileLon = centreLon + dx * span;
+      const tileLat = centreLat + dy * span;
+      // Fuera de los polos no hay nada que pedir, y el cuadro dejaría de ser cuadrado.
+      if (tileLat > 85 || tileLat < -85) continue;
+      out.push({
+        ...onlineTileAt(tileLon, tileLat, halfSpanDeg),
+        lon: tileLon,
+        lat: tileLat,
+        d: dx * dx + dy * dy,
+      });
+    }
+  }
+  out.sort((a, b) => a.d - b.d);
+  return out.map(({ id, lon: tileLon, lat: tileLat }) => ({ id, lon: tileLon, lat: tileLat }));
 }
 
 /**
@@ -670,17 +722,36 @@ const BACKOFF_MS = [20_000, 90_000, 300_000];
  * - **`request()` es barato y se puede llamar por frame**, que es como se va a usar igual.
  */
 export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
-  request(lon: number, lat: number, altitudeKm: number): void;
+  request(lon: number, lat: number, altitudeKm: number, visibleWidthDeg?: number): void;
   readonly tiles: readonly StreetTile[];
   readonly status: OnlineStatus;
 } {
   const maxAltitudeKm = options.maxAltitudeKm ?? 25;
   const halfSpanDeg = options.halfSpanDeg ?? DEFAULT_HALF_SPAN_DEG;
+  /**
+   * Nunca por debajo de lo que un anillo completo necesita.
+   *
+   * Si el recorte pudiera soltar un cuadro que la vista sigue queriendo, se volvería a pedir en
+   * cuanto se suelta: un bucle de descargas contra un servicio público, y la peor clase de bucle
+   * porque cada vuelta parece trabajo legítimo.
+   */
+  const maxTiles = Math.max(options.maxTiles ?? 64, (2 * MAX_RING + 1) ** 2);
   const tiles: StreetTile[] = [];
   const failures = new Map<string, { count: number; nextAttemptMs: number }>();
   const loaded = new Set<string>();
   let inFlight = false;
   let status: OnlineStatus = 'idle';
+
+  /** Suelta los tiles más lejanos cuando sobran, para que pasear no acumule sin fin. */
+  const trim = (lon: number, lat: number): void => {
+    if (tiles.length <= maxTiles) return;
+    const distance = (tile: StreetTile): number => {
+      const [minLon, minLat, maxLon, maxLat] = tile.bbox;
+      return ((minLon + maxLon) / 2 - lon) ** 2 + ((minLat + maxLat) / 2 - lat) ** 2;
+    };
+    tiles.sort((a, b) => distance(a) - distance(b));
+    for (const dropped of tiles.splice(maxTiles)) loaded.delete(dropped.id);
+  };
 
   return {
     tiles,
@@ -688,40 +759,68 @@ export function createOnlineStreetSource(options: OnlineStreetSourceOptions): {
       return status;
     },
 
-    request(lon, lat, altitudeKm) {
+    request(lon, lat, altitudeKm, visibleWidthDeg = 0) {
       if (inFlight || altitudeKm > maxAltitudeKm) return;
       if (!isOnline()) {
         status = 'offline';
         return;
       }
 
-      const { id } = onlineTileAt(lon, lat, halfSpanDeg);
-      if (loaded.has(id)) {
-        status = 'idle';
+      /**
+       * Se pide **un** cuadro por vez, pero el que toque de los que cubren la vista, del centro
+       * hacia afuera. Uno solo cubría el 7 % del ancho de la pantalla a 25 km, así que el mapa se
+       * quedaba en blanco aunque el tile llegara bien; pedirlos todos a la vez, en cambio, encola
+       * la cuota de Overpass y no trae ninguno antes.
+       */
+      const wanted = tilesCovering(lon, lat, visibleWidthDeg, halfSpanDeg);
+      const now = Date.now();
+      let target: { id: string; lon: number; lat: number } | undefined;
+      let pending = 0;
+      let exhausted = 0;
+      let here = 0;
+
+      for (const candidate of wanted) {
+        if (loaded.has(candidate.id)) {
+          here++;
+          continue;
+        }
+        const failure = failures.get(candidate.id);
+        if (failure) {
+          if (failure.count >= BACKOFF_MS.length) {
+            exhausted++;
+            continue;
+          }
+          if (now < failure.nextAttemptMs) {
+            pending++;
+            continue;
+          }
+        }
+        target = candidate;
+        break;
+      }
+
+      if (!target) {
+        // Sin nada que pedir, lo que se informa es por qué: hay datos, se espera un reintento, o
+        // se dejó de insistir. Decir "listo" cuando no se pudo traer nada es la peor opción.
+        status = pending > 0 ? 'retrying' : exhausted > 0 && here === 0 ? 'unavailable' : 'idle';
         return;
       }
 
-      const failure = failures.get(id);
-      if (failure) {
-        if (failure.count >= BACKOFF_MS.length) {
-          status = 'unavailable';
-          return;
-        }
-        if (Date.now() < failure.nextAttemptMs) {
-          status = 'retrying';
-          return;
-        }
-      }
-
+      const id = target.id;
       inFlight = true;
       status = 'fetching';
 
-      void fetchOnlineStreets(lon, lat, options)
+      void fetchOnlineStreets(target.lon, target.lat, options)
         .then((result) => {
+          // Antes de publicar el estado: si no, quien observe `status` verá que ya no se está
+          // consultando mientras la siguiente petición todavía rebota contra el cerrojo.
+          inFlight = false;
+
           if (result.status === 'ok') {
             loaded.add(id);
             failures.delete(id);
             tiles.push(result.tile);
+            trim(lon, lat);
             status = 'idle';
             options.onTile?.(result.tile, result.bytes);
             return;

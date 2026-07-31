@@ -259,7 +259,18 @@ async function loadStreetsFor(lon: number, lat: number, altitudeKm: number): Pro
     return;
   }
 
-  onlineStreets.request(lon, lat, altitudeKm);
+  // El ancho de la vista en grados: sin él solo se pediría el cuadro bajo la cámara, que a
+  // 25 km de altitud cubre el 7 % de la pantalla — el tile llegaba y no se veía nada.
+  const projection = buildProjection(
+    earth,
+    createCameraState(earth.id, { lon, lat, altitudeKm }),
+    view,
+  );
+  const visibleWidthDeg =
+    ((projection.metersPerCell() * cols) / 1000 / ((Math.PI / 180) * earth.radiusKm)) /
+    Math.max(0.2, Math.cos((lat * Math.PI) / 180));
+
+  onlineStreets.request(lon, lat, altitudeKm, visibleWidthDeg);
 }
 
 /**
@@ -268,9 +279,20 @@ async function loadStreetsFor(lon: number, lat: number, altitudeKm: number): Pro
  * no se arregla.
  */
 function streetsStatus(lon: number, lat: number, altitudeKm: number): string {
-  if (streets.length > 0) {
-    const vias = streets.reduce((n, t) => n + t.roads.length, 0);
-    return `${streets.map((t) => t.name).join(', ')}  ${vias} vías`;
+  /**
+   * Solo cuentan los tiles que cubren *este* sitio.
+   *
+   * Sumarlos todos hacía que el panel dijera "Medellín, 3 400 vías" estando sobre Buenos Aires,
+   * porque Medellín seguía cargada de antes. Es la peor forma de fallar de un indicador: afirmar
+   * que hay datos justo donde no los hay.
+   */
+  const aqui = streets.filter(
+    ({ bbox }) => lon >= bbox[0] && lon <= bbox[2] && lat >= bbox[1] && lat <= bbox[3],
+  );
+  if (aqui.length > 0) {
+    const vias = aqui.reduce((n, t) => n + t.roads.length, 0);
+    const otros = streets.length - aqui.length;
+    return `${aqui.map((t) => t.name).join(', ')}  ${vias} vías${otros > 0 ? ` (+${otros} en caché)` : ''}`;
   }
   if (tileAt((streetsMeta as unknown as StreetsMeta).tiles, lon, lat)) return 'cargando…';
   if (altitudeKm > STREETS_ALTITUDE_KM) return 'sin datos aquí';

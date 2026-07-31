@@ -182,6 +182,25 @@ describe('present', () => {
     expect(counts.drawImage - afterFirst.drawImage).toBe(0);
   });
 
+  it('cuando cambia casi todo, borra de una vez en vez de celda a celda', async () => {
+    /**
+     * Repintar el fondo por celda cuesta un `fillRect` **además** del glifo: dos operaciones donde
+     * puede haber una. Arrastrando cambia casi todo el cuadro, que es justo cuando más importa.
+     */
+    const renderer = await makeRenderer(80, 24);
+    renderer.present(filledGrid(80, 24), NO_CHROME);
+    const afterFirst = { ...counts };
+
+    // Otro cuadro completamente distinto: la cámara se movió.
+    renderer.present(filledGrid(80, 24, 5), NO_CHROME);
+
+    const rects = counts.fillRect - afterFirst.fillRect;
+    const glyphs = counts.drawImage - afterFirst.drawImage;
+    expect(glyphs).toBeGreaterThan(80 * 24 * 0.9);
+    // Un solo borrado para todo el lienzo, no uno por celda.
+    expect(rects).toBe(1);
+  });
+
   it('invalidate fuerza un repintado completo', async () => {
     const renderer = await makeRenderer(40, 10);
     const grid = filledGrid(40, 10);

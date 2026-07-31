@@ -16,6 +16,7 @@ import {
   overpassQuery,
   resetMirrorHealth,
   slotWaitSeconds,
+  tilesCovering,
   type OverpassWay,
 } from '../src/index.js';
 
@@ -527,6 +528,116 @@ describe('la política de cortesía del origen en línea', () => {
 
     for (let i = 0; i < 100; i++) source.request(-40, 30, 1);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Una calle dentro del cuadro que se pidió, leyéndolo de la propia consulta.
+   *
+   * Devolver siempre la misma calle no sirve para probar la cobertura: cae fuera del bbox de los
+   * cuadros vecinos, el codificador la recorta, y el resultado es "aquí no hay calles" — que es
+   * una respuesta legítima y hace pasar el test por el motivo equivocado.
+   */
+  function calleEnLaCaja(init: RequestInit | undefined): OverpassWay[] {
+    const data = (init?.body as URLSearchParams | undefined)?.get('data') ?? '';
+    const m = /\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)/.exec(data);
+    if (!m) return [];
+    const [minLat, minLon, maxLat, maxLon] = m.slice(1).map(Number) as [
+      number,
+      number,
+      number,
+      number,
+    ];
+    const cLon = (minLon + maxLon) / 2;
+    const cLat = (minLat + maxLat) / 2;
+    const d = (maxLon - minLon) / 8;
+    return [
+      way({ highway: 'primary' }, [
+        [cLon - d, cLat],
+        [cLon, cLat + d / 4],
+        [cLon + d, cLat],
+      ]),
+    ];
+  }
+
+  it('cubre la vista, no solo el cuadro de debajo de la cámara', async () => {
+    /**
+     * El cuadro se achicó a 0.07° para que Overpass lo sirviera, y a esa medida cubre el 7 % del
+     * ancho de la pantalla a 25 km de altitud. El tile llegaba bien y no se veía nada: un parche
+     * diminuto en mitad de una vista mucho más ancha.
+     */
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/status')) {
+        return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
+      }
+      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+    }) as unknown as typeof fetch;
+
+    const source = createOnlineStreetSource(nunca);
+    // Una vista de medio grado de ancho: hacen falta varios cuadros de 0.07°.
+    for (let i = 0; i < 12; i++) {
+      source.request(-74.07, 4.65, 20, 0.5);
+      await vi.waitFor(() => expect(source.status).not.toBe('fetching'));
+    }
+
+    expect(source.tiles.length).toBeGreaterThan(4);
+    // Y todos distintos: cada uno cubre un trozo de la vista.
+    expect(new Set(source.tiles.map((t) => t.id)).size).toBe(source.tiles.length);
+  });
+
+  it('pide del centro hacia afuera: primero lo que se está mirando', async () => {
+    const centro = tilesCovering(-74.07, 4.65, 0.5)[0]!;
+    expect(centro.id).toBe(tilesCovering(-74.07, 4.65, 0)[0]!.id);
+
+    // Y a más vista, más cuadros — pero acotados, para no barrer el planeta.
+    expect(tilesCovering(-74.07, 4.65, 0).length).toBe(1);
+    expect(tilesCovering(-74.07, 4.65, 0.5).length).toBeGreaterThan(4);
+    expect(tilesCovering(-74.07, 4.65, 90).length).toBeLessThanOrEqual(25);
+  });
+
+  it('no acumula ciudades sin fin al pasear por el mundo', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/status')) {
+        return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
+      }
+      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+    }) as unknown as typeof fetch;
+    const source = createOnlineStreetSource(nunca);
+
+    for (let i = 0; i < 40; i++) {
+      source.request(-74.07, 4.65 + i * 0.5, 1);
+      await vi.waitFor(() => expect(source.status).not.toBe('fetching'));
+    }
+    expect(source.tiles.length).toBeLessThanOrEqual(64);
+  });
+
+  it('el recorte nunca suelta un cuadro que la vista sigue queriendo', async () => {
+    /**
+     * Sería un bucle de descargas contra un servicio público, y de la peor clase: cada vuelta
+     * parece trabajo legítimo. Por eso el límite nunca baja de lo que cabe en un anillo completo,
+     * aunque quien llama pida menos.
+     */
+    let consultas = 0;
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/status')) {
+        return Promise.resolve({ ok: true, text: async () => '2 slots available now.' });
+      }
+      consultas++;
+      return Promise.resolve(respondeCon(calleEnLaCaja(init)));
+    }) as unknown as typeof fetch;
+
+    const source = createOnlineStreetSource({ ...nunca, maxTiles: 2 });
+    // Vista ancha, sin mover la cámara: pide el anillo entero y luego no debería pedir más.
+    for (let i = 0; i < 40; i++) {
+      source.request(-74.07, 4.65, 20, 0.5);
+      await vi.waitFor(() => expect(source.status).not.toBe('fetching'));
+    }
+    const tras40 = consultas;
+
+    for (let i = 0; i < 20; i++) {
+      source.request(-74.07, 4.65, 20, 0.5);
+      await vi.waitFor(() => expect(source.status).not.toBe('fetching'));
+    }
+    expect(consultas).toBe(tras40);
   });
 
   it('no pide nada por encima de la escala en la que se dibujarían calles', () => {

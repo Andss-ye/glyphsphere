@@ -71,6 +71,7 @@ export {
   overpassQuery,
   resetMirrorHealth,
   slotWaitSeconds,
+  tilesCovering,
   type OnlineStatus,
   type OnlineStreetSourceOptions,
   type OnlineStreetsOptions,

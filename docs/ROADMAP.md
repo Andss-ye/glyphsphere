@@ -173,6 +173,15 @@ trick if profiling shows this is over budget on a real grid size"*). Lo mostró.
 - **El panel se actualiza a 8 Hz, no a 60.** Son una veintena de escrituras al DOM para mostrar
   números que nadie lee sesenta veces por segundo.
 
+Y dos más, sobre la comparación entre cuadros:
+
+- **Se compara de palabra en palabra, no de byte en byte.** Una celda son exactamente cuatro
+  bytes, así que verla como `uint32` compara las cuatro de una vez: en 274x77 son 21 000
+  comparaciones en lugar de 84 000.
+- **Cuando cambia más de la mitad del cuadro se borra el lienzo entero de una vez.** Repintar el
+  fondo celda a celda cuesta un `fillRect` *además* del glifo — dos operaciones donde puede haber
+  una — y arrastrando cambia casi todo, que es justo cuando importa.
+
 Y la lección de fondo: **el contador del panel medía media tarea y por eso tranquilizaba**. Decía
 5 ms mientras el cuadro real costaba mucho más. Ahora muestra `pipeline + present` por separado y
 avisa pasando de 16 ms, que es el presupuesto de verdad a 60 fps.
@@ -233,6 +242,21 @@ servicio público real.
     a los tres espejos y la búsqueda se rendía en medio segundo teniéndolos todos disponibles. Lo
     peor fue cómo se escondió: comprobarlo a mano con `curl` decía 200, porque `curl` sí manda un
     User-Agent. Hay test de regresión.
+
+11. **Un cuadro no cubre la pantalla, y eso era una regresión propia.** Achicarlo a 0.07° arregló
+    el 504 y rompió otra cosa: a esa medida cubre el **7 %** del ancho visible a 25 km de altitud
+    y el 17 % a 10 km. El tile llegaba perfecto y en pantalla no se veía nada, porque era un
+    parche diminuto en mitad de una vista mucho más ancha — que es exactamente lo que se reportó
+    como "cargó Medellín pero en Buenos Aires no aparece nada". Ahora se piden los cuadros que
+    cubren la vista, **uno por vez y del centro hacia afuera**, así que lo que se está mirando
+    llega primero y la cuota de Overpass no se encola.
+12. **El panel afirmaba que había datos donde no los había.** Sumaba todos los tiles cargados, así
+    que decía "Medellín, 3 400 vías" estando sobre Buenos Aires. Ahora cuenta solo los que cubren
+    el punto bajo la cámara.
+
+Queda una limitación honesta: a 25 km de altitud cubrir la vista entera serían ~49 consultas, que
+no se le piden a un servicio gratuito. La cobertura en línea es completa desde unos 10 km hacia
+abajo — que es donde se miran calles — y parcial por encima.
 
 **Lo que sigue sin depender de nosotros.** Los tres espejos son servidores públicos gratuitos y se
 saturan de verdad: midiéndolos en un mismo minuto, dos aceptaban la conexión sin contestar nunca y
