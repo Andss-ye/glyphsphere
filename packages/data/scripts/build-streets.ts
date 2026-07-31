@@ -26,6 +26,7 @@ import {
   SIMPLIFY_M,
   WATER_CLASS,
   encodeOsmStreets,
+  geometryOf,
   overpassQuery,
   type OverpassWay,
 } from '@glyphsphere/layers';
@@ -37,10 +38,16 @@ const CACHE_DIR = join(here, '..', '.cache', 'streets');
 /**
  * Espejos de Overpass, en orden de preferencia. Se rota entre ellos ante un fallo temporal: son
  * servidores públicos y gratuitos, y saturarlos es a la vez descortés e inútil.
+ *
+ * Los mismos que el origen en línea, y por el mismo motivo: `overpass.kumi.systems` estaba acá y
+ * es un CNAME de `overpass.private.coffee` — un solo servidor con dos nombres, así que la lista de
+ * "dos espejos" era uno. Cuando ese host se cuelga (medido: acepta el TLS y no contesta en 45 s),
+ * el build se quedaba sin alternativa y horneaba la ciudad a medias o nada.
  */
 const MIRRORS = [
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
 /** Overpass exige identificarse; un User-Agent anónimo recibe 406. */
@@ -68,6 +75,20 @@ const POLITE_GAP_MS = 1_500;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Espejos que ya fallaron **en esta ejecución**, para no volver a pagarles el plazo en cada
+ * sub-cuadro.
+ *
+ * Sin esto el reintento es `MIRRORS[attempt % MIRRORS.length]`: cada uno de los 48 sub-cuadros
+ * vuelve a probar, desde cero, el espejo que rechaza la conexión y el que acepta el TLS y no
+ * contesta. Medido acá con los espejos como están hoy, eran unos dos minutos por sub-cuadro —
+ * casi hora y media de build, por encima del límite de Vercel, para acabar con las ciudades sin
+ * hornear. Con la lista, el primer sub-cuadro descubre quién contesta y los otros 47 van directos.
+ *
+ * Si fallan todos se vuelve a la lista completa: rendirse garantiza no hornear nada.
+ */
+const caidos = new Set<string>();
+
+/**
  * Ciudades horneadas. Agregar una es agregar una línea: la capa las descubre por el manifiesto y
  * elige por bbox, sin saber cuáles son.
  *
@@ -88,11 +109,16 @@ async function fetchBox(
   const cached = join(CACHE_DIR, `${key}.json`);
 
   if (!existsSync(cached)) {
-    const data = overpassQuery(bbox);
+    // El servidor recibe el mismo plazo que espera el cliente. Pedirle los 180 s por defecto y
+    // colgar a los 90 lo deja trabajando para nadie, y Overpass cobra el turno por lo pedido.
+    const data = overpassQuery(bbox, Math.floor(REQUEST_TIMEOUT_MS / 1000));
     let lastError = '';
 
     for (let attempt = 0; attempt < MIRRORS.length * 3; attempt++) {
-      const mirror = MIRRORS[attempt % MIRRORS.length]!;
+      // Los que ya fallaron hoy se saltan; si no queda ninguno, se vuelve a la lista entera.
+      const vivos = MIRRORS.filter((m) => !caidos.has(m));
+      const pool = vivos.length > 0 ? vivos : MIRRORS;
+      const mirror = pool[attempt % pool.length]!;
       try {
         const response = await fetch(mirror, {
           method: 'POST',
@@ -106,19 +132,40 @@ async function fetchBox(
         });
 
         if (response.ok) {
+          const text = await response.text();
+
+          /**
+           * Overpass avisa de sus propios errores **con HTTP 200**: `elements` vacío más un
+           * `remark` explicando que la consulta agotó su tiempo o se quedó sin memoria. Cachear
+           * eso es peor que fallar — el sub-cuadro queda en disco como "aquí no hay nada" y
+           * ninguna ejecución posterior lo vuelve a pedir, así que la ciudad se hornea con un
+           * agujero permanente. Es el mismo cuidado que ya tenía el origen en línea.
+           */
+          const remark = (JSON.parse(text) as { remark?: string }).remark;
+          if (remark !== undefined) {
+            lastError = `remark: ${remark}`;
+            caidos.add(mirror);
+            await sleep(2000 * (attempt + 1));
+            continue;
+          }
+
           mkdirSync(CACHE_DIR, { recursive: true });
-          writeFileSync(cached, Buffer.from(await response.arrayBuffer()));
+          writeFileSync(cached, text);
+          // Contestó: vuelve a ser el preferido aunque hubiera fallado antes.
+          caidos.delete(mirror);
           await sleep(POLITE_GAP_MS);
           break;
         }
 
         // 429 y 504 son "estoy ocupado", no "no existe": esperan y se reintentan.
         lastError = `HTTP ${response.status}`;
+        caidos.add(mirror);
         if (response.status !== 429 && response.status !== 504) {
           throw new Error(`${key}: Overpass returned ${response.status}`);
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
+        caidos.add(mirror);
       }
 
       await sleep(2000 * (attempt + 1));
@@ -132,8 +179,23 @@ async function fetchBox(
     }
   }
 
-  return (JSON.parse(readFileSync(cached, 'utf8')).elements as OverpassWay[]).filter(
-    (way) => way.type === 'way' && way.geometry && way.geometry.length >= 2,
+  /**
+   * La geometría se lee con `geometryOf`, **nunca mirando la forma a mano**.
+   *
+   * Acá estaba el fallo que vació las tres ciudades en producción. El filtro era
+   * `way.geometry.length >= 2`, que solo vale para la forma vieja (`[{lon,lat}, ...]`). Desde que
+   * la consulta pasa por `convert`, Overpass devuelve geometría GeoJSON — un objeto
+   * `{type, coordinates}` cuyo `.length` es `undefined` — así que el filtro descartaba **todas**
+   * las vías y la ciudad se horneaba con cero.
+   *
+   * No se vio en local porque `.cache/streets` conservaba respuestas de la forma vieja: el build
+   * las reusaba y salía bien. En Vercel no hay caché, se descargaba con la consulta nueva, y el
+   * deploy publicaba `bogota.bin.gz` de 71 bytes con `ways: 0`. El mapa no dibujaba nada y no
+   * había ni una petición que mirar, porque el manifiesto afirmaba que el tile estaba ahí.
+   */
+  const payload = JSON.parse(readFileSync(cached, 'utf8')) as { elements?: OverpassWay[] };
+  return (payload.elements ?? []).filter(
+    (way) => way.type === 'way' && geometryOf(way).length >= 2,
   );
 }
 
@@ -203,6 +265,21 @@ export async function buildStreets(): Promise<void> {
     const bbox = [lon - h, lat - h, lon + h, lat + h] as const;
 
     const { bytes, wayCount, pointCount } = encodeOsmStreets(ways, bbox, earth.radiusKm);
+
+    /**
+     * Una ciudad sin vías **no entra en el manifiesto**.
+     *
+     * Un tile vacío es la peor forma de fallar que tiene este build: el manifiesto afirma que
+     * la ciudad está horneada, la capa se lo cree, y el origen en línea nunca llega a
+     * intentarlo — el mapa se queda mudo sin una sola petición que mirar. Es exactamente lo
+     * que se publicó en Vercel. Omitirla es peor mapa y mejor verdad: la red la cubre.
+     */
+    if (wayCount === 0) {
+      pendientes.push(city.name);
+      console.warn(`  ${city.name}: Overpass no devolvió ni una vía, se omite del manifiesto`);
+      continue;
+    }
+
     const gz = gzipSync(bytes, { level: 9 });
     const file = `${city.id}.bin.gz`;
     writeFileSync(join(OUT_DIR, file), gz);
